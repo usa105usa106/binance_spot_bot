@@ -106,3 +106,13 @@ python bot.py
 Бот использует публичные Binance Spot endpoints. Binance API-ключи не нужны.
 
 Аналитика не является финансовой рекомендацией.
+
+
+## v5 Railway fallback fix
+
+- Добавлен `main.py` как fallback-entrypoint, если Railway продолжает запускать старую команду `python main.py`.
+- Основной запуск остается через `bot.py`.
+- В `bot.py` добавлен `import logging`.
+- В `railway.json` добавлен `startCommand`: `python bot.py`.
+
+Если кнопки не реагируют, сначала проверь Deploy Logs: контейнер должен быть запущен без ошибки `can't open file /app/main.py`.
