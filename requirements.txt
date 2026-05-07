@@ -1,0 +1,8 @@
+python-telegram-bot==22.3
+requests==2.32.4
+matplotlib==3.10.3
+mplfinance==0.12.10b0
+pandas==2.3.1
+numpy==2.3.1
+psutil==7.0.0
+python-dotenv==1.1.1
