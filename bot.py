@@ -46,17 +46,59 @@ from typing import Any
 import requests
 
 
+class BinanceAPIError(RuntimeError):
+    pass
+
+
 class BinanceClient:
     def __init__(self, base_url: str, timeout: int = 15):
-        self.base_url = base_url.rstrip("/")
+        self.base_urls = self._build_base_urls(base_url)
+        self.base_url = self.base_urls[0]
         self.timeout = timeout
+        self.session = requests.Session()
         self._symbols_cache: tuple[float, set[str]] | None = None
 
+    @staticmethod
+    def _build_base_urls(base_url: str) -> list[str]:
+        configured = [x.strip().rstrip("/") for x in os.getenv("BINANCE_BASE_URLS", "").split(",") if x.strip()]
+        defaults = [
+            base_url.rstrip("/"),
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com",
+            "https://api4.binance.com",
+            "https://data-api.binance.vision",
+        ]
+        result: list[str] = []
+        for url in configured + defaults:
+            if url and url not in result:
+                result.append(url)
+        return result
+
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        url = f"{self.base_url}{path}"
-        response = requests.get(url, params=params, timeout=self.timeout)
-        response.raise_for_status()
-        return response.json()
+        last_error = "неизвестная ошибка"
+        for base_url in self.base_urls:
+            url = f"{base_url}{path}"
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                if response.status_code in {451, 403, 418, 429} or response.status_code >= 500:
+                    last_error = f"HTTP {response.status_code}"
+                    continue
+                response.raise_for_status()
+                self.base_url = base_url
+                if not response.content:
+                    return {}
+                return response.json()
+            except requests.RequestException as exc:
+                last_error = exc.__class__.__name__
+                continue
+            except ValueError:
+                last_error = "некорректный JSON от Binance"
+                continue
+        raise BinanceAPIError(
+            "Binance API сейчас недоступен с этого сервера. "
+            "Попробуйте позже или задайте BINANCE_BASE_URLS с доступным зеркалом/API endpoint."
+        )
 
     def exchange_symbols(self) -> set[str]:
         now = time.time()
@@ -777,7 +819,17 @@ class TradingBot:
                     await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
             Path(chart).unlink(missing_ok=True)
         except Exception as exc:
-            await update.message.reply_text(f"Ошибка анализа: {html.escape(str(exc))}", reply_markup=self.main_keyboard())
+            logging.exception("Analysis failed")
+            await update.message.reply_text(self.user_error_text(exc), reply_markup=self.main_keyboard())
+
+
+    @staticmethod
+    def user_error_text(exc: Exception) -> str:
+        if isinstance(exc, BinanceAPIError):
+            return "⚠️ Binance API временно недоступен с сервера бота. Я уже пробую резервные endpoints. Повторите запрос чуть позже."
+        if isinstance(exc, ValueError):
+            return f"⚠️ {html.escape(str(exc))}"
+        return "⚠️ Не удалось выполнить анализ. Повторите запрос позже."
 
     async def callback_router(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -844,9 +896,10 @@ class TradingBot:
             self.binance._get("/api/v3/ping")
             response_ms = (time.perf_counter() - started) * 1000
             status = "OK"
-        except Exception:
+        except Exception as exc:
+            logging.warning("Binance ping failed: %s", exc)
             response_ms = -1
-            status = "ERROR"
+            status = "недоступен"
         return (
             f"🏓 Binance ping: {status}\n"
             f"⏱ Отклик: {response_ms:.0f} ms\n"

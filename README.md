@@ -37,6 +37,7 @@ MONITOR_INTERVAL_MINUTES=30
 STRONG_CHANGE_THRESHOLD=35
 BOT_VERSION=00001
 BINANCE_BASE_URL=https://api.binance.com
+BINANCE_BASE_URLS=https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision
 ```
 
 ## Запуск на Railway
@@ -116,3 +117,7 @@ python bot.py
 - В `railway.json` добавлен `startCommand`: `python bot.py`.
 
 Если кнопки не реагируют, сначала проверь Deploy Logs: контейнер должен быть запущен без ошибки `can't open file /app/main.py`.
+
+
+### Binance 451/403
+Бот автоматически перебирает резервные endpoints Binance (`api1`-`api4` и `data-api.binance.vision`) и больше не отправляет пользователю сырые ошибки с URL/JSON-превью. При необходимости укажите свои endpoints в `BINANCE_BASE_URLS` через запятую.
