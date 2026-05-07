@@ -93,3 +93,24 @@ python main.py
 - `bot/storage.py` — SQLite память пользователей/монет.
 - `bot/monitor.py` — фоновый мониторинг стакана.
 - `Procfile`, `railway.json` — адаптация под Railway.
+
+
+## Исправление для Railway: ModuleNotFoundError: No module named 'bot'
+
+В этой версии исправлена ошибка импорта пакета `bot`:
+
+- добавлен файл `bot/__init__.py`;
+- в `main.py` добавлен путь проекта в `sys.path`;
+- добавлен `Dockerfile` с `WORKDIR /app` и `PYTHONPATH=/app`;
+- архив собран так, чтобы `main.py`, `Procfile`, `requirements.txt` и папка `bot/` лежали сразу в корне ZIP.
+
+При загрузке на Railway важно загружать содержимое проекта, а не папку внутри папки. В корне деплоя должны быть:
+
+```text
+main.py
+bot/
+requirements.txt
+Procfile
+Dockerfile
+railway.json
+```

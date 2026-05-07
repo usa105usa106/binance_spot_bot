@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
+# Railway sometimes starts the app with a working directory that is not added
+# to Python imports. This guarantees that /app/bot is importable.
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 import asyncio
 import logging
 
