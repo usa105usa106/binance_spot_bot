@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 # ===== bot/config.py =====
+import logging
 import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
