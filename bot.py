@@ -23,7 +23,7 @@ class Config:
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
     strong_change_threshold: float = 35.0
-    bot_version: str = "00006"
+    bot_version: str = "00007"
 
 
 def get_config() -> Config:
@@ -38,7 +38,7 @@ def get_config() -> Config:
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
         strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00006"),
+        bot_version=os.getenv("BOT_VERSION", "00007"),
     )
 
 # ===== bot/binance_client.py =====
@@ -514,6 +514,56 @@ def _select_structural_swings(df: pd.DataFrame, mode: str, bearish: bool, lookba
         seq = pivots[-max_points:]
     return seq[-max_points:]
 
+
+def _find_sh_spikes(
+    df: pd.DataFrame,
+    structural_highs: list[tuple[int, float]],
+    bearish: bool,
+    lookback: int = 160,
+    max_spikes: int = 3,
+) -> list[tuple[int, float]]:
+    """Находит Swing High-выносы, которые являются локальными максимумами, но не входят
+    в основную структурную цепочку SH.
+
+    Для SHORT это важный случай: точка может быть настоящим Swing High, но она выше
+    линии понижающихся SH и ломает чистую нисходящую структуру. Поэтому её лучше
+    показать красным кругом как "SH вынос", но не включать в синюю трендовую линию.
+    """
+    if df.empty or not bearish or len(structural_highs) < 2:
+        return []
+
+    tail_len = min(lookback, len(df))
+    tail = df.tail(tail_len).reset_index(drop=True)
+    pivots = _pivot_points(tail["high"], window=3, mode="high")
+    if not pivots:
+        return []
+
+    structural_idx = {int(i) for i, _ in structural_highs}
+    x1, y1 = structural_highs[0]
+    x2, y2 = structural_highs[-1]
+    if x2 == x1:
+        return []
+    slope = (y2 - y1) / (x2 - x1)
+
+    high_low = (tail["high"].astype(float) - tail["low"].astype(float)).replace([np.inf, -np.inf], np.nan).dropna()
+    typical_range = float(high_low.median()) if not high_low.empty else float(tail["close"].iloc[-1]) * 0.002
+    threshold = max(typical_range * 0.7, float(tail["close"].iloc[-1]) * 0.001)
+
+    spikes: list[tuple[int, float, float]] = []
+    for x, y in pivots:
+        if x in structural_idx:
+            continue
+        trend_y = y1 + slope * (x - x1)
+        excess = float(y) - float(trend_y)
+        # Вынос должен быть заметно выше основной линии SH, а не просто мелким шумом.
+        if excess > threshold:
+            spikes.append((int(x), float(y), excess))
+
+    # Показываем самые заметные выносы, по времени слева направо.
+    spikes = sorted(spikes, key=lambda item: item[2], reverse=True)[:max_spikes]
+    spikes = sorted(spikes, key=lambda item: item[0])
+    return [(x, y) for x, y, _ in spikes]
+
 def _build_trendline(df: pd.DataFrame, trend_bias: float | None = None, mode: str | None = None, lookback: int = 90) -> TrendLine:
     """Строит профессиональную линию структуры рынка.
 
@@ -891,7 +941,7 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
     for name, level in fib_items:
         ax.axhline(level, color="#05805c", linewidth=1.25, linestyle="--", alpha=0.95)
         ax.text(
-            label_x + 2.0, level, f"Фибо {name}\n{_fmt(level)}",
+            label_x + 2.0, level, f"Фибо {name} — {_fmt(level)}",
             color="#047857",
             va="center",
             ha="left",
@@ -906,6 +956,7 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
     bearish = direction == "SHORT"
     swing_highs = _select_structural_swings(df, mode="high", bearish=bearish, lookback=len(df), max_points=5)
     swing_lows = _select_structural_swings(df, mode="low", bearish=bearish, lookback=len(df), max_points=5)
+    sh_spikes = _find_sh_spikes(df, swing_highs, bearish=bearish, lookback=len(df), max_spikes=2)
 
     def draw_swing_structure(points: list[tuple[int, float]], line_color: str, prefix: str, dashed: bool = False) -> int:
         if len(points) >= 2:
@@ -934,10 +985,25 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
     high_touches = draw_swing_structure(swing_highs, "#2563eb", "SH", dashed=False)
     low_touches = draw_swing_structure(swing_lows, "#2563eb", "SL", dashed=True)
 
+    # SH-выносы: реальные Swing High, которые выше линии понижающихся SH.
+    # Красным кругом показываем их на графике, но не включаем в основную трендовую линию SHORT.
+    if sh_spikes:
+        xs = [int(i) for i, _ in sh_spikes]
+        ys = [float(v) for _, v in sh_spikes]
+        ax.scatter(xs, ys, facecolors="none", edgecolors="#e11d48", s=150, zorder=10, linewidths=3.0)
+        ax.scatter(xs, ys, color="#e11d48", s=22, zorder=11)
+        for n, (x, y) in enumerate(sh_spikes, start=1):
+            ax.annotate(
+                f"SH вынос {n}\n{_fmt(y)}", xy=(x, y), xytext=(0, 18), textcoords="offset points",
+                ha="center", va="bottom", fontsize=8.7, fontweight="bold", color="#e11d48",
+                bbox=dict(boxstyle="round,pad=0.18", facecolor="#ffffff", edgecolor="#e11d48", linewidth=0.9, alpha=0.9),
+                annotation_clip=True,
+            )
+
     # Мини-легенда под графиком: объясняет, что именно отмечено.
     ax.text(
         0.50, -0.085,
-        "SH = Swing High / локальный максимум   ·   SL = Swing Low / локальный минимум   ·   жёлтый круг = структурная swing-точка",
+        "SH = Swing High / локальный максимум   ·   SL = Swing Low / локальный минимум   ·   жёлтый круг = структурная swing-точка   ·   красный круг = SH вынос",
         transform=ax.transAxes, ha="center", va="top", fontsize=9.5, color="black",
         bbox=dict(boxstyle="round,pad=0.25", facecolor="#ffffff", edgecolor="#9ca3af", linewidth=0.8, alpha=0.95),
         clip_on=False,
@@ -947,8 +1013,8 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
         f"СЦЕНАРИЙ: {direction}\n"
         f"LONG: {result.long_probability:.0f}%\n"
         f"SHORT: {result.short_probability:.0f}%\n"
-        f"Касаний минимум {low_touches}\n"
-        f"Касаний максимум {high_touches}"
+        f"Касаний минимум SL: {low_touches}\n"
+        f"Касаний максимум SH: {high_touches}"
     )
     ax.text(
         0.01, 0.98, scenario_box,
