@@ -23,7 +23,7 @@ class Config:
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
     strong_change_threshold: float = 35.0
-    bot_version: str = "00004"
+    bot_version: str = "00006"
 
 
 def get_config() -> Config:
@@ -38,7 +38,7 @@ def get_config() -> Config:
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
         strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00004"),
+        bot_version=os.getenv("BOT_VERSION", "00006"),
     )
 
 # ===== bot/binance_client.py =====
@@ -468,12 +468,78 @@ def _pivot_points(series: pd.Series, window: int, mode: str) -> list[tuple[int, 
     return pivots
 
 
+
+
+def _select_structural_swings(df: pd.DataFrame, mode: str, bearish: bool, lookback: int = 90, max_points: int = 5) -> list[tuple[int, float]]:
+    """Возвращает реальные Swing High / Swing Low, которые образуют структуру рынка.
+
+    SHORT: понижающиеся SH и понижающиеся SL.
+    LONG: повышающиеся SH и повышающиеся SL.
+
+    Это не случайные свечи: точка берётся только если она является локальным экстремумом
+    относительно соседних свечей, после чего выбирается монотонная структурная цепочка.
+    """
+    if mode not in {"high", "low"} or df.empty:
+        return []
+    tail_len = min(lookback, len(df))
+    tail = df.tail(tail_len).reset_index(drop=True)
+    source = tail["high"] if mode == "high" else tail["low"]
+    pivots = _pivot_points(source, window=3, mode=mode)
+    if len(pivots) < 2:
+        return pivots[-max_points:]
+
+    # Ищем лучшую монотонную подпоследовательность по времени.
+    # Для нисходящего рынка цены экстремумов должны снижаться, для восходящего — расти.
+    def ok(prev: float, cur: float) -> bool:
+        return cur < prev if bearish else cur > prev
+
+    n = len(pivots)
+    dp = [1] * n
+    prev_idx = [-1] * n
+    for i in range(n):
+        for j in range(i):
+            if ok(pivots[j][1], pivots[i][1]) and dp[j] + 1 > dp[i]:
+                dp[i] = dp[j] + 1
+                prev_idx[i] = j
+
+    # Предпочитаем длинную и свежую цепочку.
+    best = max(range(n), key=lambda i: (dp[i], pivots[i][0]))
+    seq: list[tuple[int, float]] = []
+    while best != -1:
+        seq.append(pivots[best])
+        best = prev_idx[best]
+    seq.reverse()
+
+    if len(seq) < 2:
+        seq = pivots[-max_points:]
+    return seq[-max_points:]
+
 def _build_trendline(df: pd.DataFrame, trend_bias: float | None = None, mode: str | None = None, lookback: int = 90) -> TrendLine:
-    # Строим наклонные именно по структуре: повышающиеся минимумы и понижающиеся максимумы.
+    """Строит профессиональную линию структуры рынка.
+
+    LONG/восходящий рынок:
+    - highs: повышающиеся максимумы
+    - lows: повышающиеся минимумы
+
+    SHORT/нисходящий рынок:
+    - highs: понижающиеся максимумы
+    - lows: понижающиеся минимумы
+    """
+    bias = float(trend_bias or 0.0)
+    bearish = bias < 0
     if mode not in {"low", "high"}:
-        mode = "low" if (trend_bias or 0) >= 0 else "high"
+        mode = "high" if bearish else "low"
     kind = "support" if mode == "low" else "resistance"
-    label = "повышающиеся минимумы" if mode == "low" else "понижающиеся максимумы"
+
+    if bearish:
+        label = "понижающиеся минимумы" if mode == "low" else "понижающиеся максимумы"
+        def correct_structure(v1: float, v2: float) -> bool:
+            return v2 < v1
+    else:
+        label = "повышающиеся минимумы" if mode == "low" else "повышающиеся максимумы"
+        def correct_structure(v1: float, v2: float) -> bool:
+            return v2 > v1
+
     source = df["low"] if mode == "low" else df["high"]
     tail_len = min(lookback, len(df))
     source_tail = source.tail(tail_len).reset_index(drop=True)
@@ -481,31 +547,31 @@ def _build_trendline(df: pd.DataFrame, trend_bias: float | None = None, mode: st
 
     chosen = None
     if len(pivots) >= 2:
-        recent = pivots[-12:]
+        recent = pivots[-14:]
         best_score = -10**9
         for a in range(len(recent) - 1):
             p1 = recent[a]
             for p2 in recent[a + 1:]:
                 dx = max(p2[0] - p1[0], 1)
-                correct_structure = (mode == "low" and p2[1] > p1[1]) or (mode == "high" and p2[1] < p1[1])
-                if not correct_structure:
+                if not correct_structure(p1[1], p2[1]):
                     continue
-                # Предпочитаем свежие линии с большим числом касаний около наклонной.
                 slope = (p2[1] - p1[1]) / dx
                 line = np.array([p1[1] + slope * (i - p1[0]) for i in range(len(source_tail))], dtype=float)
                 tolerance = max(float(df["close"].iloc[-1]) * 0.0035, 1e-12)
                 touches = int(np.sum(np.abs(source_tail.to_numpy(dtype=float) - line) <= tolerance))
-                score = touches * 100 + p2[0] - abs(slope / max(float(df["close"].iloc[-1]), 1e-9))
+                # Свежесть + число касаний важнее всего.
+                score = touches * 100 + p2[0] * 1.5 - abs(slope / max(float(df["close"].iloc[-1]), 1e-9))
                 if score > best_score:
                     best_score = score
                     chosen = (p1, p2)
+
     if chosen is None and len(pivots) >= 2:
+        # Если строгая структура не найдена, берём две последние точки: лучше показать факт касаний, чем пустоту.
         chosen = (pivots[-2], pivots[-1])
 
     if chosen is not None:
         (i1, y1), (i2, y2) = chosen
     else:
-        # Fallback: линейная регрессия по видимым low/high, если явных касаний мало.
         x = np.arange(len(source_tail), dtype=float)
         slope, intercept = np.polyfit(x, source_tail.to_numpy(dtype=float), 1)
         i1, i2 = 0, len(source_tail) - 1
@@ -515,7 +581,7 @@ def _build_trendline(df: pd.DataFrame, trend_bias: float | None = None, mode: st
         i2 = i1 + 1
     slope = (y2 - y1) / (i2 - i1)
     current_value = float(y1 + slope * ((tail_len - 1) - i1))
-    slope_percent = float((current_value / max(y1, 1e-9) - 1) * 100)
+    slope_percent = float((current_value / max(abs(y1), 1e-9) - 1) * 100)
 
     line = np.array([y1 + slope * (i - i1) for i in range(tail_len)], dtype=float)
     tolerance = max(float(df["close"].iloc[-1]) * 0.0035, 1e-12)
@@ -533,7 +599,6 @@ def _build_trendline(df: pd.DataFrame, trend_bias: float | None = None, mode: st
         touches=touches,
         text=f"{label}: {current_value:.6g} ({slope_percent:+.2f}%, касаний: {touches})",
     )
-
 
 def _trend_score(df: pd.DataFrame) -> float:
     close = df["close"]
@@ -720,163 +785,287 @@ def _fmt(value: float) -> str:
 
 
 def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) -> Path:
-    """Создает крупный, читаемый PNG 1920x1080: уровни, наклонки с касаниями и весь анализ на фото."""
+    """Профессиональный белый график в стиле TradingView/Binance: крупные свечи, правые цены,
+    фибо в цельных окошках справа, жёлтые касания структуры и анализ в зелёной рамке снизу."""
     df = result.df.tail(90).copy()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.close()
     out = Path(tmp.name)
 
-    market_colors = mpf.make_marketcolors(up="#16a34a", down="#dc2626", edge="inherit", wick="inherit", volume="inherit")
+    market_colors = mpf.make_marketcolors(
+        up="#149560", down="#d23b3b", edge="inherit", wick="inherit", volume="inherit"
+    )
     style = mpf.make_mpf_style(
         base_mpf_style="default",
         marketcolors=market_colors,
         gridstyle="-",
-        gridcolor="#e5e7eb",
+        gridcolor="#e9ecef",
         facecolor="#ffffff",
         figcolor="#ffffff",
         rc={
-            "font.size": 14,
-            "axes.labelsize": 15,
+            "font.size": 13,
+            "axes.labelsize": 14,
             "axes.titlesize": 20,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 13,
         },
     )
 
     fig, axes = mpf.plot(
         df,
         type="candle",
-        volume=True,
+        volume=False,
         style=style,
         returnfig=True,
-        figsize=(19.2, 10.8),
+        figsize=(16, 10),
         tight_layout=False,
-        panel_ratios=(5, 1),
-        datetime_format="%d.%m %H:%M",
+        datetime_format="%H:%M",
         xrotation=0,
         warn_too_much_data=300,
     )
-    bottom_space = 0.24 if full_analysis_text else 0.08
-    fig.subplots_adjust(left=0.035, right=0.84, top=0.92, bottom=bottom_space, hspace=0.03)
     ax = axes[0]
-    vol_ax = axes[2] if len(axes) > 2 else axes[-1]
+    bottom_space = 0.23 if full_analysis_text else 0.10
+    fig.subplots_adjust(left=0.045, right=0.90, top=0.89, bottom=bottom_space)
 
-    title = f"{result.symbol} · BINANCE SPOT · TF {result.interval} · цена {_fmt(result.price)}"
-    ax.set_title(title, loc="left", color="black", pad=18, fontsize=24, fontweight="bold")
+    direction = result.projection.direction
+    title_symbol = result.symbol.replace("USDT", "_USDT")
+    window_move = (df["close"].iloc[-1] / df["close"].iloc[0] - 1.0) * 100
+    candle_move = window_move / max(len(df), 1)
+    ax.set_title(
+        f"{title_symbol} · {result.interval} график\nНаклонка {window_move:+.2f}% за окно ({candle_move:+.4f}%/свечу)",
+        loc="center",
+        color="black",
+        pad=10,
+        fontsize=20,
+        fontweight="bold",
+    )
 
-    # Горизонтальные уровни стакана.
-    ax.axhline(result.support.price, color="#22c55e", linewidth=2.4, linestyle="-", alpha=0.95)
-    ax.axhline(result.resistance.price, color="#f43f5e", linewidth=2.4, linestyle="-", alpha=0.95)
+    # Правая шкала цены.
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.set_ylabel("Цена (USDT)", color="black", fontweight="bold")
+    ax.set_xlabel(f"Свечи {result.interval}", color="black", fontweight="bold")
 
     right_x = len(df) - 1
-    label_x = len(df) + 2.8
-    ax.axhline(result.price, color="#2563eb", linewidth=2.0, linestyle="-", alpha=0.9)
-    ax.text(label_x, result.price, f"  ТЕКУЩАЯ ЦЕНА {_fmt(result.price)}", color="#2563eb", va="center", fontsize=14, fontweight="bold")
-    ax.text(label_x, result.support.price, f"  SUPPORT стакан {_fmt(result.support.price)}", color="#22c55e", va="center", fontsize=14, fontweight="bold")
-    ax.text(label_x, result.resistance.price, f"  RESISTANCE стакан {_fmt(result.resistance.price)}", color="#f43f5e", va="center", fontsize=14, fontweight="bold")
+    label_x = len(df) + 4.0
 
-    # Fibonacci по выбранному таймфрейму.
-    # Fibonacci: красные линии, черные подписи справа, чтобы не закрывать свечи.
-    for name, level in result.fib_levels.items():
-        ax.axhline(level, color="#dc2626", linewidth=1.35, linestyle="-", alpha=0.92)
-        ax.text(label_x, level, f"  Fib {name}  {_fmt(level)}", color="black", va="center", fontsize=13, fontweight="bold", clip_on=False)
+    def price_box(y: float, text: str, edge: str = "#111827", text_color: str = "black", lw: float = 1.4) -> None:
+        ax.text(
+            label_x, y, f" {text} ",
+            color=text_color,
+            va="center",
+            ha="left",
+            fontsize=12.5,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.28", facecolor="#ffffff", edgecolor=edge, linewidth=lw, alpha=0.98),
+            clip_on=False,
+        )
 
-    # Две наклонные структуры: повышающиеся минимумы и понижающиеся максимумы.
-    support_line = _build_trendline(result.df, mode="low", lookback=len(df))
-    resistance_line = _build_trendline(result.df, mode="high", lookback=len(df))
+    # Важные уровни справа: стоп, вход, цена.
+    entry = result.price
+    stop = result.projection.invalidation
+    if direction == "SHORT":
+        stop = max(stop, result.resistance.price)
+        entry = min(result.price, result.support.price) if result.support.price < result.price else result.price
+    else:
+        stop = min(stop, result.support.price)
+        entry = max(result.price, result.resistance.price) if result.resistance.price > result.price else result.price
 
-    def draw_line_with_touches(tl: TrendLine, color: str, y_col: str, label_y: str) -> None:
-        slope = (tl.end_price - tl.start_price) / max(tl.end_index - tl.start_index, 1)
-        xs = np.arange(0, len(df), dtype=float)
-        ys = np.array([tl.start_price + slope * (x - tl.start_index) for x in xs], dtype=float)
-        ax.plot(xs, ys, color=color, linewidth=1.55, alpha=0.90)
-        y_values = df[y_col].to_numpy(dtype=float)
-        tolerance = max(float(result.price) * 0.0035, 1e-12)
-        touch_idx = [int(i) for i, v in enumerate(y_values) if abs(v - ys[i]) <= tolerance]
-        if len(touch_idx) > 8:
-            touch_idx = touch_idx[-8:]
-        if touch_idx:
-            ax.scatter(touch_idx, [y_values[i] for i in touch_idx], color="#facc15", s=54, zorder=7, edgecolors="black", linewidths=0.7)
-        ax.text(label_x, ys[-1], label_y, color=color, fontsize=11, fontweight="bold", va="center", ha="left", bbox=dict(boxstyle="round,pad=0.22", facecolor="#ffffff", edgecolor=color, alpha=0.92), clip_on=False)
+    ax.axhline(stop, color="#ef4444", linewidth=1.15, linestyle="--", alpha=0.9)
+    ax.axhline(entry, color="#111827", linewidth=1.15, linestyle="--", alpha=0.9)
+    ax.axhline(result.price, color="#6b7280", linewidth=1.1, linestyle="--", alpha=0.7)
+    price_box(stop, f"СТОП {_fmt(stop)}", edge="#ef4444")
+    price_box(entry, f"ВХОД {_fmt(entry)}", edge="#111827")
+    price_box(result.price, f"ЦЕНА {_fmt(result.price)}", edge="#9ca3af", text_color="#374151")
 
-    draw_line_with_touches(support_line, "#16a34a", "low", f"Минимумы · касаний {support_line.touches}")
-    draw_line_with_touches(resistance_line, "#dc2626", "high", f"Максимумы · касаний {resistance_line.touches}")
-    tl = result.trendline
+    # Фибо: линии и цельные окошки справа в стиле примера. Берём ближайшие рабочие уровни.
+    fib_order = ["23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
+    if direction == "SHORT":
+        fib_items = [(k, result.fib_levels[k]) for k in fib_order if k in result.fib_levels and result.fib_levels[k] < entry]
+        fib_items = sorted(fib_items, key=lambda kv: kv[1], reverse=True)[:3]
+    else:
+        fib_items = [(k, result.fib_levels[k]) for k in fib_order if k in result.fib_levels and result.fib_levels[k] > entry]
+        fib_items = sorted(fib_items, key=lambda kv: kv[1])[:3]
+    if not fib_items:
+        fib_items = list(result.fib_levels.items())[-3:]
+    for name, level in fib_items:
+        ax.axhline(level, color="#05805c", linewidth=1.25, linestyle="--", alpha=0.95)
+        ax.text(
+            label_x + 2.0, level, f"Фибо {name}\n{_fmt(level)}",
+            color="#047857",
+            va="center",
+            ha="left",
+            fontsize=11.5,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.32", facecolor="#ffffff", edgecolor="#047857", linewidth=1.5, alpha=0.98),
+            clip_on=False,
+        )
 
-    # Прогноз: стрелка и цели движения по ближайшим уровням.
-    proj = result.projection
-    arrow_color = "#22c55e" if proj.direction == "LONG" else "#ef4444"
-    future_x1 = right_x + 4
-    future_x2 = right_x + 10
-    ax.annotate(
-        "",
-        xy=(future_x1, proj.target_1),
-        xytext=(right_x, result.price),
-        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.25, linestyle="--"),
-        annotation_clip=False,
-    )
-    ax.annotate(
-        "",
-        xy=(future_x2, proj.target_2),
-        xytext=(future_x1, proj.target_1),
-        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.15, linestyle="--"),
-        annotation_clip=False,
-    )
-    ax.text(label_x, proj.target_1, f"  Цель 1 {_fmt(proj.target_1)} ({proj.move_1_percent:+.2f}%)", color=arrow_color, fontsize=12, fontweight="bold", va="center")
-    ax.text(label_x, proj.target_2, f"  Цель 2 {_fmt(proj.target_2)} ({proj.move_2_percent:+.2f}%)", color=arrow_color, fontsize=12, fontweight="bold", va="center")
-    ax.axhline(proj.invalidation, color="#94a3b8", linewidth=1.2, linestyle=":", alpha=0.75)
-    ax.text(label_x, proj.invalidation, f"  Отмена: {_fmt(proj.invalidation)}", color="#cbd5e1", fontsize=10, va="center", ha="left", clip_on=False)
+    # Структура рынка: реальные Swing High / Swing Low, а не случайные свечи.
+    # SHORT: понижающиеся SH + понижающиеся SL. LONG: повышающиеся SH + повышающиеся SL.
+    bearish = direction == "SHORT"
+    swing_highs = _select_structural_swings(df, mode="high", bearish=bearish, lookback=len(df), max_points=5)
+    swing_lows = _select_structural_swings(df, mode="low", bearish=bearish, lookback=len(df), max_points=5)
 
-    # Компактный блок вынесен в свободную зону, чтобы не перекрывать свечи.
-    info = (
-        f"LONG {result.long_probability:.1f}% / SHORT {result.short_probability:.1f}%\n"
-        f"{proj.direction}: T1 {_fmt(proj.target_1)} → T2 {_fmt(proj.target_2)}\n"
-        f"Стакан {result.orderbook_bias * 100:+.1f}% · Тренд {result.trend_bias * 100:+.1f}%"
-    )
-    # Рекомендация вынесена в правую свободную зону в зеленую рамку: свечи и Fibonacci остаются открытыми.
+    def draw_swing_structure(points: list[tuple[int, float]], line_color: str, prefix: str, dashed: bool = False) -> int:
+        if len(points) >= 2:
+            x1, y1 = points[0]
+            x2, y2 = points[-1]
+            if x2 == x1:
+                x2 = x1 + 1
+            slope = (y2 - y1) / (x2 - x1)
+            xs = np.arange(max(0, x1 - 1), len(df) + 5, dtype=float)
+            ys = np.array([y1 + slope * (x - x1) for x in xs], dtype=float)
+            ax.plot(xs, ys, color=line_color, linewidth=1.45, alpha=0.98, linestyle="--" if dashed else "-")
+        if points:
+            xs = [int(i) for i, _ in points]
+            ys = [float(v) for _, v in points]
+            ax.scatter(xs, ys, facecolors="none", edgecolors="#f5e600", s=92, zorder=8, linewidths=2.7)
+            ax.scatter(xs, ys, color="#f5e600", s=16, zorder=9)
+            for n, (x, y) in enumerate(points, start=1):
+                offset = 11 if prefix == "SH" else -21
+                ax.annotate(
+                    f"{prefix}{n}\n{_fmt(y)}", xy=(x, y), xytext=(0, offset), textcoords="offset points",
+                    ha="center", va="bottom" if prefix == "SH" else "top",
+                    fontsize=8.8, fontweight="bold", color="#1d4ed8", annotation_clip=True
+                )
+        return len(points)
+
+    high_touches = draw_swing_structure(swing_highs, "#2563eb", "SH", dashed=False)
+    low_touches = draw_swing_structure(swing_lows, "#2563eb", "SL", dashed=True)
+
+    # Мини-легенда под графиком: объясняет, что именно отмечено.
     ax.text(
-        1.012, 0.985, info,
-        transform=ax.transAxes,
-        fontsize=11,
-        color="black",
-        va="top",
-        ha="left",
-        bbox=dict(boxstyle="round,pad=0.45", facecolor="#ffffff", edgecolor="#16a34a", linewidth=2.0, alpha=0.96),
+        0.50, -0.085,
+        "SH = Swing High / локальный максимум   ·   SL = Swing Low / локальный минимум   ·   жёлтый круг = структурная swing-точка",
+        transform=ax.transAxes, ha="center", va="top", fontsize=9.5, color="black",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="#ffffff", edgecolor="#9ca3af", linewidth=0.8, alpha=0.95),
         clip_on=False,
     )
 
-    # Чтобы справа поместились подписи, цена и стрелки прогноза.
-    ax.set_xlim(-2, len(df) + 16)
-    lows = [df["low"].min(), *result.fib_levels.values(), result.support.price, proj.target_1, proj.target_2, proj.invalidation]
-    highs = [df["high"].max(), *result.fib_levels.values(), result.resistance.price, proj.target_1, proj.target_2, proj.invalidation]
-    ymin, ymax = min(lows), max(highs)
-    pad = max((ymax - ymin) * 0.10, result.price * 0.005)
-    ax.set_ylim(ymin - pad, ymax + pad)
+    scenario_box = (
+        f"СЦЕНАРИЙ: {direction}\n"
+        f"LONG: {result.long_probability:.0f}%\n"
+        f"SHORT: {result.short_probability:.0f}%\n"
+        f"Касаний минимум {low_touches}\n"
+        f"Касаний максимум {high_touches}"
+    )
+    ax.text(
+        0.01, 0.98, scenario_box,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=13,
+        color="black",
+        fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.38", facecolor="#ffffff", edgecolor="#111827", linewidth=1.3, alpha=0.97),
+    )
 
-    ax.yaxis.tick_right()
-    ax.yaxis.set_label_position("right")
-    ax.set_ylabel("Цена", color="black")
-    vol_ax.set_ylabel("Объем", color="black")
-    for axis in [ax, vol_ax]:
-        axis.tick_params(axis="both", colors="black")
-        for spine in axis.spines.values():
-            spine.set_color("#9ca3af")
+    # Верхний правый блок RR/рынок.
+    risk = abs(entry - stop)
+    reward = abs(result.projection.target_1 - entry)
+    rr = reward / risk if risk > 0 else 0.0
+    ax.text(
+        0.985, 0.98,
+        f"RR TP1: {rr:.2f}\nРынок: {_fmt(result.price)}\nНаклон/св: {candle_move:+.4f}%",
+        transform=ax.transAxes,
+        va="top",
+        ha="right",
+        fontsize=12,
+        color="black",
+        fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#ffffff", edgecolor="#2563eb", linewidth=1.3, alpha=0.97),
+    )
 
+    # Стрелка сценария — тонкая, сбоку, не закрывает свечи.
+    arrow_color = "#111827"
+    arrow_target = result.projection.target_1
+    ax.annotate(
+        direction,
+        xy=(right_x + 2.0, arrow_target),
+        xytext=(right_x - 5.0, result.price),
+        fontsize=16,
+        fontweight="bold",
+        color="black",
+        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.6),
+        annotation_clip=False,
+    )
+
+    # Рекомендация: зелёная рамка сбоку/снизу, не закрывает свечи и Фибо.
+    rec_text = (
+        "РЕКОМЕНДАЦИЯ\n"
+        f"Вход: {_fmt(entry)}\n"
+        f"Стоп: {_fmt(stop)}\n"
+        f"Цели:\n1) {_fmt(result.projection.target_1)}\n2) {_fmt(result.projection.target_2)}\nRR TP1: {rr:.2f}"
+    )
+    if full_analysis_text:
+        fig.text(
+            0.825, 0.035, rec_text,
+            color="black",
+            fontsize=11.5,
+            va="bottom",
+            ha="left",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="#ffffff", edgecolor="#16a34a", linewidth=1.7, alpha=0.98),
+        )
+    else:
+        ax.text(
+            1.01, 0.08, rec_text,
+            transform=ax.transAxes,
+            color="black",
+            fontsize=11.5,
+            va="bottom",
+            ha="left",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="#ffffff", edgecolor="#16a34a", linewidth=1.7, alpha=0.98),
+            clip_on=False,
+        )
+
+    # Полный анализ внизу в зелёной рамке, только если выбран режим "вся инфа в картинке".
     if full_analysis_text:
         clean = re.sub(r"[`*_]", "", full_analysis_text)
         clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+        if "Анализ:" not in clean:
+            structure = "понижающиеся максимумы и понижающиеся минимумы" if direction == "SHORT" else "повышающиеся максимумы и повышающиеся минимумы"
+            clean = (
+                f"Анализ: Цена формирует {structure}.\n"
+                f"Сценарий: {direction}. Вход {_fmt(entry)}, стоп {_fmt(stop)}, цели {_fmt(result.projection.target_1)} / {_fmt(result.projection.target_2)}.\n"
+                f"Рекомендация: {result.recommendation}\n"
+                + clean
+            )
         wrapped_lines = []
         for line in clean.splitlines():
-            wrapped_lines.extend(textwrap.wrap(line, width=150) if line.strip() else [""])
-        bottom_text = "\n".join(wrapped_lines)
-        fig.text(0.035, 0.035, bottom_text, color="black", fontsize=10.5, va="bottom", ha="left",
-                 bbox=dict(boxstyle="round,pad=0.45", facecolor="#ffffff", edgecolor="#16a34a", linewidth=1.6, alpha=0.97))
+            wrapped_lines.extend(textwrap.wrap(line, width=118) if line.strip() else [""])
+        bottom_text = "\n".join(wrapped_lines[:9])
+        fig.text(
+            0.045, 0.035, bottom_text,
+            color="black",
+            fontsize=11.5,
+            va="bottom",
+            ha="left",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="#ffffff", edgecolor="#047857", linewidth=1.6, alpha=0.98),
+        )
     else:
-        fig.text(0.70, 0.025, "Не является финансовой рекомендацией.", color="#4b5563", fontsize=12)
+        fig.text(0.045, 0.035, "Не является финансовой рекомендацией. Соблюдайте риск-менеджмент.", color="#4b5563", fontsize=11)
 
-    fig.savefig(out, dpi=130, facecolor=fig.get_facecolor())
+    # Пространство справа под ценники и Фибо.
+    ax.set_xlim(-1, len(df) + 13)
+    lows = [df["low"].min(), result.price, stop, entry, result.projection.target_1, result.projection.target_2, *[v for _, v in fib_items]]
+    highs = [df["high"].max(), result.price, stop, entry, result.projection.target_1, result.projection.target_2, *[v for _, v in fib_items]]
+    ymin, ymax = min(lows), max(highs)
+    pad = max((ymax - ymin) * 0.12, result.price * 0.004)
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    for axis in [ax]:
+        axis.tick_params(axis="both", colors="black")
+        for spine in axis.spines.values():
+            spine.set_color("#111827")
+            spine.set_linewidth(0.8)
+
+    fig.savefig(out, dpi=150, facecolor="#ffffff", bbox_inches="tight")
     plt.close(fig)
     return out
+
 
 # ===== bot/telegram_bot.py =====
 import html

@@ -35,7 +35,7 @@ DEFAULT_QUOTE=USDT
 ORDERBOOK_LIMIT=1000
 MONITOR_INTERVAL_MINUTES=30
 STRONG_CHANGE_THRESHOLD=35
-BOT_VERSION=00002
+BOT_VERSION=00006
 BINANCE_BASE_URL=https://api.binance.com
 BINANCE_BASE_URLS=https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision
 ```
