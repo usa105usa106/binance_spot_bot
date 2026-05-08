@@ -21,7 +21,7 @@ class Config:
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
     strong_change_threshold: float = 35.0
-    bot_version: str = "00001"
+    bot_version: str = "00002"
 
 
 def get_config() -> Config:
@@ -36,7 +36,7 @@ def get_config() -> Config:
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
         strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00001"),
+        bot_version=os.getenv("BOT_VERSION", "00002"),
     )
 
 # ===== bot/binance_client.py =====
@@ -439,31 +439,44 @@ def _pivot_points(series: pd.Series, window: int, mode: str) -> list[tuple[int, 
     return pivots
 
 
-def _build_trendline(df: pd.DataFrame, trend_bias: float) -> TrendLine:
-    # При восходящем уклоне строим наклонку по повышающимся минимумам, при нисходящем — по понижающимся максимумам.
-    mode = "low" if trend_bias >= 0 else "high"
+def _build_trendline(df: pd.DataFrame, trend_bias: float | None = None, mode: str | None = None, lookback: int = 90) -> TrendLine:
+    # Строим наклонные именно по структуре: повышающиеся минимумы и понижающиеся максимумы.
+    if mode not in {"low", "high"}:
+        mode = "low" if (trend_bias or 0) >= 0 else "high"
     kind = "support" if mode == "low" else "resistance"
-    label = "наклонная поддержка по минимумам" if mode == "low" else "наклонное сопротивление по максимумам"
+    label = "повышающиеся минимумы" if mode == "low" else "понижающиеся максимумы"
     source = df["low"] if mode == "low" else df["high"]
-    pivots = _pivot_points(source.tail(140).reset_index(drop=True), window=3, mode=mode)
+    tail_len = min(lookback, len(df))
+    source_tail = source.tail(tail_len).reset_index(drop=True)
+    pivots = _pivot_points(source_tail, window=3, mode=mode)
 
+    chosen = None
     if len(pivots) >= 2:
-        # Берем две наиболее свежие опорные точки с правильной структурой, иначе последние две.
-        chosen = None
-        recent = pivots[-8:]
-        for a in range(len(recent) - 2, -1, -1):
+        recent = pivots[-12:]
+        best_score = -10**9
+        for a in range(len(recent) - 1):
             p1 = recent[a]
             for p2 in recent[a + 1:]:
-                rising_lows = mode == "low" and p2[1] >= p1[1]
-                falling_highs = mode == "high" and p2[1] <= p1[1]
-                if rising_lows or falling_highs:
+                dx = max(p2[0] - p1[0], 1)
+                correct_structure = (mode == "low" and p2[1] > p1[1]) or (mode == "high" and p2[1] < p1[1])
+                if not correct_structure:
+                    continue
+                # Предпочитаем свежие линии с большим числом касаний около наклонной.
+                slope = (p2[1] - p1[1]) / dx
+                line = np.array([p1[1] + slope * (i - p1[0]) for i in range(len(source_tail))], dtype=float)
+                tolerance = max(float(df["close"].iloc[-1]) * 0.0035, 1e-12)
+                touches = int(np.sum(np.abs(source_tail.to_numpy(dtype=float) - line) <= tolerance))
+                score = touches * 100 + p2[0] - abs(slope / max(float(df["close"].iloc[-1]), 1e-9))
+                if score > best_score:
+                    best_score = score
                     chosen = (p1, p2)
-        if chosen is None:
-            chosen = (pivots[-2], pivots[-1])
+    if chosen is None and len(pivots) >= 2:
+        chosen = (pivots[-2], pivots[-1])
+
+    if chosen is not None:
         (i1, y1), (i2, y2) = chosen
     else:
-        # Fallback: линейная регрессия по low/high на видимом участке.
-        source_tail = source.tail(140).reset_index(drop=True)
+        # Fallback: линейная регрессия по видимым low/high, если явных касаний мало.
         x = np.arange(len(source_tail), dtype=float)
         slope, intercept = np.polyfit(x, source_tail.to_numpy(dtype=float), 1)
         i1, i2 = 0, len(source_tail) - 1
@@ -472,21 +485,19 @@ def _build_trendline(df: pd.DataFrame, trend_bias: float) -> TrendLine:
     if i2 == i1:
         i2 = i1 + 1
     slope = (y2 - y1) / (i2 - i1)
-    current_value = float(y1 + slope * ((min(140, len(df)) - 1) - i1))
+    current_value = float(y1 + slope * ((tail_len - 1) - i1))
     slope_percent = float((current_value / max(y1, 1e-9) - 1) * 100)
 
-    # Количество касаний около линии, чтобы показать надежность наклонки.
-    tail = df.tail(140).reset_index(drop=True)
-    line = np.array([y1 + slope * (i - i1) for i in range(len(tail))], dtype=float)
-    tolerance = max(float(tail["close"].iloc[-1]) * 0.004, 1e-12)
-    touches_source = tail["low"].to_numpy(dtype=float) if mode == "low" else tail["high"].to_numpy(dtype=float)
+    line = np.array([y1 + slope * (i - i1) for i in range(tail_len)], dtype=float)
+    tolerance = max(float(df["close"].iloc[-1]) * 0.0035, 1e-12)
+    touches_source = source_tail.to_numpy(dtype=float)
     touches = int(np.sum(np.abs(touches_source - line) <= tolerance))
 
     return TrendLine(
         kind=kind,
         start_index=int(i1),
         start_price=float(y1),
-        end_index=int(len(tail) - 1),
+        end_index=int(tail_len - 1),
         end_price=float(current_value),
         current_value=current_value,
         slope_percent=slope_percent,
@@ -505,22 +516,66 @@ def _trend_score(df: pd.DataFrame) -> float:
     return float(np.clip((ema_score + mom_score) / 2, -1, 1))
 
 
-def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, resistance: OrderBookLevel, long_probability: float) -> PriceProjection:
+def _timeframe_target_step(interval: str, price: float, df: pd.DataFrame) -> float:
+    """Минимальная дистанция целей с учётом таймфрейма и текущей волатильности."""
+    tf_mult = {
+        "1m": 0.003, "3m": 0.004, "5m": 0.005, "15m": 0.008, "30m": 0.010,
+        "1h": 0.015, "2h": 0.020, "4h": 0.030, "6h": 0.040, "8h": 0.045,
+        "12h": 0.055, "1d": 0.080, "3d": 0.120, "1w": 0.180, "1M": 0.250,
+    }.get(interval, 0.020)
+    try:
+        high_low = df["high"] - df["low"]
+        high_close = (df["high"] - df["close"].shift()).abs()
+        low_close = (df["low"] - df["close"].shift()).abs()
+        atr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean().iloc[-1]
+        atr_step = float(atr) if np.isfinite(atr) and atr > 0 else 0.0
+    except Exception:
+        atr_step = 0.0
+    return max(price * tf_mult, atr_step * 0.8, price * 0.002, 1e-12)
+
+
+def _unique_targets(candidates: list[float], start: float, direction: str, step: float, count: int = 2) -> list[float]:
+    targets: list[float] = []
+    last = start
+    ordered = sorted(set(float(x) for x in candidates if np.isfinite(x)), reverse=(direction == "SHORT"))
+    for value in ordered:
+        if direction == "LONG" and value > last + step * 0.35:
+            targets.append(value)
+            last = value
+        elif direction == "SHORT" and value < last - step * 0.35:
+            targets.append(value)
+            last = value
+        if len(targets) >= count:
+            break
+    while len(targets) < count:
+        last = last + step if direction == "LONG" else last - step
+        targets.append(last)
+    return targets
+
+
+def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, resistance: OrderBookLevel, long_probability: float, interval: str, df: pd.DataFrame) -> PriceProjection:
+    # Цели LONG/SHORT не должны совпадать с поддержкой/сопротивлением.
+    # Дистанция целей учитывает выбранный таймфрейм и ATR, чтобы на 15m цели были ближе, а на 1d/1w дальше.
     levels = sorted(set([*fibs.values(), support.price, resistance.price]))
-    above = [v for v in levels if v > price]
-    below = [v for v in levels if v < price]
+    step = _timeframe_target_step(interval, price, df)
+    min_gap = max(step * 0.35, price * 0.0015, 1e-12)
     if long_probability >= 50:
-        t1 = above[0] if above else price * 1.015
-        t2 = above[1] if len(above) > 1 else t1 * 1.012
-        inv = below[-1] if below else price * 0.985
+        trigger = max(price, resistance.price)
+        # LONG-цели берём только выше точки входа/сопротивления; если уровней нет — строим по волатильности таймфрейма.
+        candidates = [v for v in levels if v > trigger + min_gap]
+        t1, t2 = _unique_targets(candidates, trigger, "LONG", step, 2)
+        inv_candidates = [v for v in levels if v < min(price, support.price) - min_gap]
+        inv = inv_candidates[-1] if inv_candidates else min(price, support.price) - step * 0.8
         direction = "LONG"
-        text = f"При удержании поддержки цель: {t1:.6g} → {t2:.6g}; отмена ниже {inv:.6g}"
+        text = f"При пробое/удержании выше {trigger:.6g} цель: {t1:.6g} → {t2:.6g}; отмена ниже {inv:.6g}"
     else:
-        t1 = below[-1] if below else price * 0.985
-        t2 = below[-2] if len(below) > 1 else t1 * 0.988
-        inv = above[0] if above else price * 1.015
+        trigger = min(price, support.price)
+        candidates = [v for v in levels if v < trigger - min_gap]
+        t1, t2 = _unique_targets(candidates, trigger, "SHORT", step, 2)
+        inv_candidates = [v for v in levels if v > max(price, resistance.price) + min_gap]
+        inv = inv_candidates[0] if inv_candidates else max(price, resistance.price) + step * 0.8
         direction = "SHORT"
-        text = f"При пробое вниз цель: {t1:.6g} → {t2:.6g}; отмена выше {inv:.6g}"
+        text = f"При пробое поддержки {support.price:.6g} вниз цель: {t1:.6g} → {t2:.6g}; отмена выше {inv:.6g}"
     return PriceProjection(
         direction=direction,
         target_1=float(t1),
@@ -554,7 +609,7 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
     combined = 0.40 * orderbook_bias + 0.30 * trend_bias + 0.18 * structure_bias + 0.12 * trendline_bias
     long_probability = float(np.clip(50 + combined * 45, 5, 95))
     short_probability = 100 - long_probability
-    projection = _projection(price, fibs, support, resistance, long_probability)
+    projection = _projection(price, fibs, support, resistance, long_probability, interval, df)
 
     if long_probability >= 58:
         recommendation = "LONG / покупка от поддержки или после пробоя сопротивления"
@@ -636,8 +691,8 @@ def _fmt(value: float) -> str:
 
 
 def make_chart(result: AnalysisResult) -> Path:
-    """Создает крупный, читаемый PNG 1920x1080 с уровнями Fib, стаканом, наклонкой и прогнозом."""
-    df = result.df.tail(140).copy()
+    """Создает крупный, читаемый PNG 1920x1080: уровни, наклонки с касаниями и весь анализ на фото."""
+    df = result.df.tail(90).copy()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.close()
     out = Path(tmp.name)
@@ -651,11 +706,11 @@ def make_chart(result: AnalysisResult) -> Path:
         facecolor="#0b1220",
         figcolor="#08111f",
         rc={
-            "font.size": 13,
-            "axes.labelsize": 13,
-            "axes.titlesize": 18,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
+            "font.size": 16,
+            "axes.labelsize": 15,
+            "axes.titlesize": 22,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
         },
     )
 
@@ -672,20 +727,22 @@ def make_chart(result: AnalysisResult) -> Path:
         xrotation=0,
         warn_too_much_data=300,
     )
-    fig.subplots_adjust(left=0.055, right=0.86, top=0.90, bottom=0.11, hspace=0.06)
+    fig.subplots_adjust(left=0.045, right=0.80, top=0.88, bottom=0.24, hspace=0.05)
     ax = axes[0]
     vol_ax = axes[2] if len(axes) > 2 else axes[-1]
 
     title = f"{result.symbol} · BINANCE SPOT · TF {result.interval} · цена {_fmt(result.price)}"
-    ax.set_title(title, loc="left", color="white", pad=18, fontsize=21, fontweight="bold")
+    ax.set_title(title, loc="left", color="white", pad=18, fontsize=24, fontweight="bold")
 
     # Горизонтальные уровни стакана.
     ax.axhline(result.support.price, color="#22c55e", linewidth=2.4, linestyle="-", alpha=0.95)
     ax.axhline(result.resistance.price, color="#f43f5e", linewidth=2.4, linestyle="-", alpha=0.95)
 
     right_x = len(df) - 1
-    ax.text(right_x + 1, result.support.price, f"  SUPPORT стакан {_fmt(result.support.price)}", color="#22c55e", va="center", fontsize=12, fontweight="bold")
-    ax.text(right_x + 1, result.resistance.price, f"  RESISTANCE стакан {_fmt(result.resistance.price)}", color="#f43f5e", va="center", fontsize=12, fontweight="bold")
+    ax.axhline(result.price, color="#38bdf8", linewidth=2.0, linestyle="-", alpha=0.9)
+    ax.text(right_x + 1, result.price, f"  ТЕКУЩАЯ ЦЕНА {_fmt(result.price)}", color="#38bdf8", va="center", fontsize=14, fontweight="bold")
+    ax.text(right_x + 1, result.support.price, f"  SUPPORT стакан {_fmt(result.support.price)}", color="#22c55e", va="center", fontsize=14, fontweight="bold")
+    ax.text(right_x + 1, result.resistance.price, f"  RESISTANCE стакан {_fmt(result.resistance.price)}", color="#f43f5e", va="center", fontsize=14, fontweight="bold")
 
     # Fibonacci по выбранному таймфрейму.
     fib_colors = {
@@ -700,14 +757,29 @@ def make_chart(result: AnalysisResult) -> Path:
     for name, level in result.fib_levels.items():
         color = fib_colors.get(name, "#94a3b8")
         ax.axhline(level, color=color, linewidth=1.35, linestyle="--", alpha=0.82)
-        ax.text(right_x + 1, level, f"  Fib {name}  {_fmt(level)}", color=color, va="center", fontsize=11, fontweight="bold")
+        ax.text(right_x + 1, level, f"  Fib {name}  {_fmt(level)}", color=color, va="center", fontsize=13, fontweight="bold")
 
-    # Наклонная трендовая линия: сверху при сопротивлении, снизу при поддержке.
+    # Две наклонные структуры: повышающиеся минимумы и понижающиеся максимумы.
+    support_line = _build_trendline(result.df, mode="low", lookback=len(df))
+    resistance_line = _build_trendline(result.df, mode="high", lookback=len(df))
+
+    def draw_line_with_touches(tl: TrendLine, color: str, y_col: str, label_y: str) -> None:
+        slope = (tl.end_price - tl.start_price) / max(tl.end_index - tl.start_index, 1)
+        xs = np.arange(0, len(df), dtype=float)
+        ys = np.array([tl.start_price + slope * (x - tl.start_index) for x in xs], dtype=float)
+        ax.plot(xs, ys, color=color, linewidth=3.2, alpha=0.98)
+        y_values = df[y_col].to_numpy(dtype=float)
+        tolerance = max(float(result.price) * 0.0035, 1e-12)
+        touch_idx = [int(i) for i, v in enumerate(y_values) if abs(v - ys[i]) <= tolerance]
+        if len(touch_idx) > 8:
+            touch_idx = touch_idx[-8:]
+        if touch_idx:
+            ax.scatter(touch_idx, [y_values[i] for i in touch_idx], color=color, s=95, zorder=6, edgecolors="white", linewidths=1.0)
+        ax.text(max(1, len(df) // 3), ys[min(len(ys)-1, max(1, len(df)//3))], label_y, color=color, fontsize=15, fontweight="bold", va="bottom", bbox=dict(boxstyle="round,pad=0.25", facecolor="#0b1220", edgecolor=color, alpha=0.75))
+
+    draw_line_with_touches(support_line, "#22c55e", "low", f"Повышающиеся минимумы · касаний {support_line.touches}")
+    draw_line_with_touches(resistance_line, "#ef4444", "high", f"Понижающиеся максимумы · касаний {resistance_line.touches}")
     tl = result.trendline
-    trend_color = "#22c55e" if tl.kind == "support" else "#f59e0b"
-    ax.plot([tl.start_index, tl.end_index], [tl.start_price, tl.end_price], color=trend_color, linewidth=2.8, alpha=0.95)
-    ax.scatter([tl.start_index, tl.end_index], [tl.start_price, tl.end_price], color=trend_color, s=55, zorder=5)
-    ax.text(max(1, tl.end_index - 30), tl.end_price, f"  {tl.text}", color=trend_color, fontsize=12, fontweight="bold", va="bottom")
 
     # Прогноз: стрелка и цели движения по ближайшим уровням.
     proj = result.projection
@@ -733,28 +805,26 @@ def make_chart(result: AnalysisResult) -> Path:
     ax.axhline(proj.invalidation, color="#94a3b8", linewidth=1.2, linestyle=":", alpha=0.75)
     ax.text(1, proj.invalidation, f"Отмена сценария: {_fmt(proj.invalidation)}", color="#cbd5e1", fontsize=10, va="center")
 
-    # Информационная панель на графике.
+    # Информационная панель снизу прямо на фото: в режиме split отдельного текста/caption нет.
     nearest_fibs = sorted(result.fib_levels.items(), key=lambda x: abs(x[1] - result.price))[:5]
-    fib_lines = " | ".join([f"Fib {k}: {_fmt(v)}" for k, v in nearest_fibs])
+    fib_lines = "   ".join([f"Fib {k}: {_fmt(v)}" for k, v in nearest_fibs])
     info = (
-        f"LONG {result.long_probability:.1f}%  |  SHORT {result.short_probability:.1f}%\n"
-        f"Рекомендация: {result.recommendation}\n"
+        f"LONG {result.long_probability:.1f}%   SHORT {result.short_probability:.1f}%   |   {result.recommendation}\n"
         f"Прогноз: {proj.direction} · {proj.text}\n"
-        f"Поддержка: {_fmt(result.support.price)} · Сопротивление: {_fmt(result.resistance.price)}\n"
+        f"Поддержка стакана: {_fmt(result.support.price)}   Сопротивление стакана: {_fmt(result.resistance.price)}   Текущая: {_fmt(result.price)}\n"
         f"{fib_lines}\n"
-        f"Стакан: {result.orderbook_bias * 100:+.1f}% · Тренд: {result.trend_bias * 100:+.1f}% · Наклонка: {tl.text}"
+        f"Стакан: {result.orderbook_bias * 100:+.1f}%   Тренд: {result.trend_bias * 100:+.1f}%   Наклонка: {tl.text}"
     )
-    ax.text(
-        0.012, 0.965, info,
-        transform=ax.transAxes,
-        fontsize=13,
+    fig.text(
+        0.045, 0.055, info,
+        fontsize=15,
         color="white",
-        va="top",
-        bbox=dict(boxstyle="round,pad=0.55", facecolor="#0f172a", edgecolor="#334155", alpha=0.92),
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.65", facecolor="#0f172a", edgecolor="#334155", alpha=0.96),
     )
 
-    # Чтобы справа поместились подписи и стрелки прогноза.
-    ax.set_xlim(-2, len(df) + 28)
+    # Чтобы справа поместились подписи, цена и стрелки прогноза.
+    ax.set_xlim(-2, len(df) + 34)
     lows = [df["low"].min(), *result.fib_levels.values(), result.support.price, proj.target_1, proj.target_2, proj.invalidation]
     highs = [df["high"].max(), *result.fib_levels.values(), result.resistance.price, proj.target_1, proj.target_2, proj.invalidation]
     ymin, ymax = min(lows), max(highs)
@@ -763,7 +833,7 @@ def make_chart(result: AnalysisResult) -> Path:
 
     ax.set_ylabel("Цена", color="#cbd5e1")
     vol_ax.set_ylabel("Объем", color="#cbd5e1")
-    fig.text(0.055, 0.035, "Аналитический сигнал. Не является финансовой рекомендацией.", color="#94a3b8", fontsize=11)
+    fig.text(0.80, 0.025, "Не является финансовой рекомендацией.", color="#94a3b8", fontsize=12)
 
     fig.savefig(out, dpi=100, facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -776,7 +846,7 @@ import time
 from pathlib import Path
 
 import psutil
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -806,6 +876,18 @@ class TradingBot:
             [InlineKeyboardButton("🖼 Визуализация", callback_data="visualization"), InlineKeyboardButton("🏓 Пинг", callback_data="ping")],
         ])
 
+    def bottom_menu(self) -> ReplyKeyboardMarkup:
+        # Постоянное нижнее меню Telegram. Оно остаётся доступным, даже если inline-кнопки под старым сообщением пропали.
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("📚 Стакан ордеров"), KeyboardButton("⚙️ Настройки")],
+                [KeyboardButton("🖼 Визуализация"), KeyboardButton("🏓 Пинг")],
+                [KeyboardButton("/help"), KeyboardButton("list")],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
     async def safe_menu_update(self, query, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         """Кнопки должны работать и под текстом, и под фото."""
         try:
@@ -825,23 +907,42 @@ class TradingBot:
         await update.message.reply_text(
             "Готов к анализу Binance Spot. Напишите тикер, например `btc`, или используйте кнопки.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=self.main_keyboard(),
+            reply_markup=self.bottom_menu(),
         )
 
     async def help_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text(self.help_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard())
+        await update.message.reply_text(self.help_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=self.bottom_menu())
 
     def help_text(self) -> str:
         return (
             "*Команды бота*\n\n"
+            "*Анализ*\n"
             "`btc`, `eth`, `sol` — анализ монеты Binance Spot.\n"
+            "`BTCUSDT` — анализ готовой пары.\n\n"
+            "*Память / монеты*\n"
             "`new btc` — добавить монету в мониторинг стакана.\n"
             "`del btc` — удалить монету из мониторинга.\n"
-            "`stakan on` — включить автоотслеживание стакана каждые 30 минут.\n"
-            "`stakan off` — выключить автоотслеживание.\n"
+            "`del all` — удалить все монеты из памяти.\n"
             "`list` — список монет в памяти.\n"
-            "`/help` — помощь.\n\n"
-            "Кнопки: стакан ордеров, настройки таймфрейма, визуализация, пинг."
+            "`top-50` — загрузить топ 50 монет Binance USDT.\n"
+            "`top-100` — загрузить топ 100 монет Binance USDT.\n"
+            "`top-200` — загрузить топ 200 монет Binance USDT.\n\n"
+            "*Включение / выключение*\n"
+            "`bot on` — включить бота.\n"
+            "`bot off` — выключить анализ и автоотслеживание.\n"
+            "`stakan on` / `auto on` — включить автоотслеживание стакана.\n"
+            "`stakan off` / `auto off` — выключить автоотслеживание стакана.\n\n"
+            "*Автоотслеживание*\n"
+            "`auto 10` — проверять стакан каждые 10 минут.\n"
+            "`auto 30` — проверять стакан каждые 30 минут.\n"
+            "`auto 60` — проверять стакан каждый час.\n"
+            "`auto 1000` — проверять стакан каждые 1000 минут.\n\n"
+            "*Кнопки*\n"
+            "📚 Стакан ордеров — on/off.\n"
+            "⚙️ Настройки — таймфрейм.\n"
+            "🖼 Визуализация — картинка+подпись или весь анализ внутри картинки.\n"
+            "🏓 Пинг — статус Binance и сервера.\n\n"
+            "`/help` — показать эту справку."
         )
 
     async def text_router(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -854,6 +955,30 @@ class TradingBot:
         if lower == "list":
             symbols = self.storage.list_symbols(chat_id)
             await update.message.reply_text("Монеты в памяти: " + (", ".join(symbols) if symbols else "пусто"))
+            return
+
+
+        if lower in {"📚 стакан ордеров", "стакан ордеров"}:
+            user = self.storage.get_user(chat_id)
+            enabled = not bool(user["stakan_enabled"])
+            self.storage.set_stakan(chat_id, enabled)
+            await update.message.reply_text("Стакан ордеров: " + ("включен" if enabled else "выключен"), reply_markup=self.bottom_menu())
+            return
+
+        if lower in {"⚙️ настройки", "настройки"}:
+            await update.message.reply_text("Настройки: напишите таймфрейм `15m`, `1h`, `4h`, `1d`, `1w`, либо команду `/help`.", parse_mode=ParseMode.MARKDOWN, reply_markup=self.bottom_menu())
+            return
+
+        if lower in {"🖼 визуализация", "визуализация"}:
+            user = self.storage.get_user(chat_id)
+            new_mode = "combined" if user.get("visualization") == "split" else "split"
+            self.storage.set_visualization(chat_id, new_mode)
+            label = "весь анализ внутри картинки" if new_mode == "split" else "картинка + текстовая подпись"
+            await update.message.reply_text(f"Визуализация установлена: {label}", reply_markup=self.bottom_menu())
+            return
+
+        if lower in {"🏓 пинг", "пинг"}:
+            await update.message.reply_text(self.ping_text(), reply_markup=self.bottom_menu())
             return
 
         if lower in {"top-50", "top 50", "top50"}:
@@ -872,7 +997,13 @@ class TradingBot:
             arg = lower.split(maxsplit=1)[1]
             enabled = arg in {"on", "вкл", "1", "true"}
             self.storage.set_bot_enabled(chat_id, enabled)
-            await update.message.reply_text("Бот: " + ("включен" if enabled else "выключен"), reply_markup=self.main_keyboard())
+            await update.message.reply_text("Бот: " + ("включен" if enabled else "выключен"), reply_markup=self.bottom_menu())
+            return
+
+        if lower in {"auto on", "auto off"}:
+            enabled = lower.endswith("on")
+            self.storage.set_stakan(chat_id, enabled)
+            await update.message.reply_text("Автоотслеживание стакана: " + ("включено" if enabled else "выключено"), reply_markup=self.bottom_menu())
             return
 
         if lower.startswith("auto "):
@@ -885,14 +1016,19 @@ class TradingBot:
                 await update.message.reply_text("Доступные интервалы: 10, 30, 60, 1000 минут")
                 return
             self.storage.set_monitor_interval(chat_id, minutes)
-            await update.message.reply_text(f"Автоотслеживание стакана: каждые {minutes} мин.", reply_markup=self.main_keyboard())
+            await update.message.reply_text(f"Автоотслеживание стакана: каждые {minutes} мин.", reply_markup=self.bottom_menu())
             return
 
         if lower.startswith("stakan "):
             arg = lower.split(maxsplit=1)[1]
             enabled = arg in {"on", "вкл", "1", "true"}
             self.storage.set_stakan(chat_id, enabled)
-            await update.message.reply_text("Стакан ордеров: " + ("включен" if enabled else "выключен"), reply_markup=self.main_keyboard())
+            await update.message.reply_text("Стакан ордеров: " + ("включен" if enabled else "выключен"), reply_markup=self.bottom_menu())
+            return
+
+        if lower in TIMEFRAMES:
+            self.storage.set_timeframe(chat_id, lower)
+            await update.message.reply_text(f"Таймфрейм установлен: {lower}", reply_markup=self.bottom_menu())
             return
 
         if lower.startswith("new "):
@@ -901,7 +1037,7 @@ class TradingBot:
 
         if lower == "del all":
             self.storage.clear_symbols(chat_id)
-            await update.message.reply_text("Все монеты удалены из памяти.", reply_markup=self.main_keyboard())
+            await update.message.reply_text("Все монеты удалены из памяти.", reply_markup=self.bottom_menu())
             return
 
         if lower.startswith("del "):
@@ -923,7 +1059,7 @@ class TradingBot:
             )
         except Exception as exc:
             logging.exception("Top symbols load failed")
-            await update.message.reply_text(f"Не удалось загрузить топ монет: {html.escape(str(exc))}", reply_markup=self.main_keyboard())
+            await update.message.reply_text(f"Не удалось загрузить топ монет: {html.escape(str(exc))}", reply_markup=self.bottom_menu())
 
     async def add_coin(self, update: Update, coin: str) -> None:
         chat_id = update.effective_chat.id
@@ -949,7 +1085,7 @@ class TradingBot:
         chat_id = update.effective_chat.id
         user = self.storage.get_user(chat_id)
         if not bool(user.get("bot_enabled", 1)):
-            await update.message.reply_text("Бот выключен. Включите командой `bot on`.", parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard())
+            await update.message.reply_text("Бот выключен. Включите командой `bot on`.", parse_mode=ParseMode.MARKDOWN, reply_markup=self.bottom_menu())
             return
         try:
             symbol = self.binance.normalize_symbol(coin, self.config.default_quote)
@@ -969,7 +1105,7 @@ class TradingBot:
             Path(chart).unlink(missing_ok=True)
         except Exception as exc:
             logging.exception("Analysis failed")
-            await update.message.reply_text(self.user_error_text(exc), reply_markup=self.main_keyboard())
+            await update.message.reply_text(self.user_error_text(exc), reply_markup=self.bottom_menu())
 
 
     @staticmethod
