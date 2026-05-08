@@ -128,6 +128,21 @@ class BinanceClient:
     def ticker_price(self, symbol: str) -> float:
         return float(self._get("/api/v3/ticker/price", {"symbol": symbol})["price"])
 
+    def top_symbols_by_quote_volume(self, quote: str = "USDT", limit: int = 50) -> list[str]:
+        symbols = self.exchange_symbols()
+        tickers = self._get("/api/v3/ticker/24hr")
+        quote = quote.upper()
+        rows = []
+        for item in tickers:
+            symbol = item.get("symbol", "")
+            if symbol in symbols and symbol.endswith(quote):
+                try:
+                    rows.append((symbol, float(item.get("quoteVolume", 0.0)), int(item.get("count", 0))))
+                except (TypeError, ValueError):
+                    continue
+        rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        return [symbol for symbol, _, _ in rows[:limit]]
+
 # ===== bot/storage.py =====
 import json
 import sqlite3
@@ -155,7 +170,9 @@ class Storage:
                     chat_id INTEGER PRIMARY KEY,
                     timeframe TEXT NOT NULL DEFAULT '1h',
                     visualization TEXT NOT NULL DEFAULT 'combined',
-                    stakan_enabled INTEGER NOT NULL DEFAULT 0
+                    stakan_enabled INTEGER NOT NULL DEFAULT 0,
+                    bot_enabled INTEGER NOT NULL DEFAULT 1,
+                    monitor_interval_minutes INTEGER NOT NULL DEFAULT 30
                 );
                 CREATE TABLE IF NOT EXISTS watchlist (
                     chat_id INTEGER NOT NULL,
@@ -171,6 +188,12 @@ class Storage:
                 );
                 """
             )
+            # Миграция старой SQLite-базы без потери сохраненных монет.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "bot_enabled" not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN bot_enabled INTEGER NOT NULL DEFAULT 1")
+            if "monitor_interval_minutes" not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN monitor_interval_minutes INTEGER NOT NULL DEFAULT 30")
 
     def ensure_user(self, chat_id: int) -> None:
         with self.lock, self._connect() as conn:
@@ -197,6 +220,16 @@ class Storage:
         with self.lock, self._connect() as conn:
             conn.execute("UPDATE users SET stakan_enabled=? WHERE chat_id=?", (1 if enabled else 0, chat_id))
 
+    def set_bot_enabled(self, chat_id: int, enabled: bool) -> None:
+        self.ensure_user(chat_id)
+        with self.lock, self._connect() as conn:
+            conn.execute("UPDATE users SET bot_enabled=? WHERE chat_id=?", (1 if enabled else 0, chat_id))
+
+    def set_monitor_interval(self, chat_id: int, minutes: int) -> None:
+        self.ensure_user(chat_id)
+        with self.lock, self._connect() as conn:
+            conn.execute("UPDATE users SET monitor_interval_minutes=? WHERE chat_id=?", (minutes, chat_id))
+
     def add_symbol(self, chat_id: int, symbol: str) -> None:
         self.ensure_user(chat_id)
         with self.lock, self._connect() as conn:
@@ -207,6 +240,17 @@ class Storage:
             conn.execute("DELETE FROM watchlist WHERE chat_id=? AND symbol=?", (chat_id, symbol))
             conn.execute("DELETE FROM orderbook_snapshots WHERE chat_id=? AND symbol=?", (chat_id, symbol))
 
+    def clear_symbols(self, chat_id: int) -> None:
+        with self.lock, self._connect() as conn:
+            conn.execute("DELETE FROM watchlist WHERE chat_id=?", (chat_id,))
+            conn.execute("DELETE FROM orderbook_snapshots WHERE chat_id=?", (chat_id,))
+
+    def replace_symbols(self, chat_id: int, symbols: list[str]) -> None:
+        self.ensure_user(chat_id)
+        with self.lock, self._connect() as conn:
+            conn.execute("DELETE FROM watchlist WHERE chat_id=?", (chat_id,))
+            conn.executemany("INSERT OR IGNORE INTO watchlist(chat_id, symbol) VALUES(?,?)", [(chat_id, s) for s in symbols])
+
     def list_symbols(self, chat_id: int) -> list[str]:
         with self.lock, self._connect() as conn:
             rows = conn.execute("SELECT symbol FROM watchlist WHERE chat_id=? ORDER BY symbol", (chat_id,)).fetchall()
@@ -214,7 +258,7 @@ class Storage:
 
     def enabled_watchlists(self) -> list[tuple[int, list[str]]]:
         with self.lock, self._connect() as conn:
-            users = conn.execute("SELECT chat_id FROM users WHERE stakan_enabled=1").fetchall()
+            users = conn.execute("SELECT chat_id FROM users WHERE stakan_enabled=1 AND bot_enabled=1").fetchall()
             result: list[tuple[int, list[str]]] = []
             for user in users:
                 result.append((user["chat_id"], self.list_symbols(user["chat_id"])))
@@ -227,6 +271,14 @@ class Storage:
                 (chat_id, symbol),
             ).fetchone()
             return json.loads(row["snapshot_json"]) if row else None
+
+    def get_snapshot_meta(self, chat_id: int, symbol: str) -> tuple[dict[str, Any] | None, int | None]:
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT snapshot_json, updated_at FROM orderbook_snapshots WHERE chat_id=? AND symbol=?",
+                (chat_id, symbol),
+            ).fetchone()
+            return (json.loads(row["snapshot_json"]), int(row["updated_at"])) if row else (None, None)
 
     def set_snapshot(self, chat_id: int, symbol: str, snapshot: dict[str, Any], updated_at: int) -> None:
         with self.lock, self._connect() as conn:
@@ -336,20 +388,44 @@ def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, 
 
 
 def fibonacci_levels(df: pd.DataFrame, lookback: int = 160) -> dict[str, float]:
-    window = df.tail(min(lookback, len(df)))
-    high = float(window["high"].max())
-    low = float(window["low"].min())
-    diff = high - low
-    return {
-        "0%": high,
-        "23.6%": high - diff * 0.236,
-        "38.2%": high - diff * 0.382,
-        "50%": high - diff * 0.5,
-        "61.8%": high - diff * 0.618,
-        "78.6%": high - diff * 0.786,
-        "100%": low,
-    }
+    """Fibonacci от последнего заметного свинга, а не просто от max/min окна.
 
+    Если последний свинг был вверх: 0% = swing low, 100% = swing high.
+    Если последний свинг был вниз: 0% = swing high, 100% = swing low.
+    Так уровни на графике совпадают с направлением движения.
+    """
+    window = df.tail(min(lookback, len(df))).reset_index(drop=True)
+    if len(window) < 10:
+        high = float(window["high"].max())
+        low = float(window["low"].min())
+        diff = high - low
+        return {"0%": low, "23.6%": low + diff * 0.236, "38.2%": low + diff * 0.382, "50%": low + diff * 0.5, "61.8%": low + diff * 0.618, "78.6%": low + diff * 0.786, "100%": high}
+
+    highs = _pivot_points(window["high"], window=3, mode="high")
+    lows = _pivot_points(window["low"], window=3, mode="low")
+    pivots = sorted([(i, v, "high") for i, v in highs] + [(i, v, "low") for i, v in lows], key=lambda x: x[0])
+
+    start_price: float
+    end_price: float
+    if len(pivots) >= 2:
+        end_i, end_price, end_kind = pivots[-1]
+        opposite = "low" if end_kind == "high" else "high"
+        prior = [p for p in pivots[:-1] if p[2] == opposite]
+        if prior:
+            _, start_price, _ = prior[-1]
+        else:
+            start_price = float(window["low"].min() if end_kind == "high" else window["high"].max())
+    else:
+        high_idx = int(window["high"].idxmax())
+        low_idx = int(window["low"].idxmin())
+        if low_idx < high_idx:
+            start_price, end_price = float(window.loc[low_idx, "low"]), float(window.loc[high_idx, "high"])
+        else:
+            start_price, end_price = float(window.loc[high_idx, "high"]), float(window.loc[low_idx, "low"])
+
+    diff = end_price - start_price
+    ratios = [("0%", 0.0), ("23.6%", 0.236), ("38.2%", 0.382), ("50%", 0.5), ("61.8%", 0.618), ("78.6%", 0.786), ("100%", 1.0)]
+    return {name: float(start_price + diff * ratio) for name, ratio in ratios}
 
 def _pivot_points(series: pd.Series, window: int, mode: str) -> list[tuple[int, float]]:
     values = series.to_numpy(dtype=float)
@@ -658,11 +734,15 @@ def make_chart(result: AnalysisResult) -> Path:
     ax.text(1, proj.invalidation, f"Отмена сценария: {_fmt(proj.invalidation)}", color="#cbd5e1", fontsize=10, va="center")
 
     # Информационная панель на графике.
+    nearest_fibs = sorted(result.fib_levels.items(), key=lambda x: abs(x[1] - result.price))[:5]
+    fib_lines = " | ".join([f"Fib {k}: {_fmt(v)}" for k, v in nearest_fibs])
     info = (
         f"LONG {result.long_probability:.1f}%  |  SHORT {result.short_probability:.1f}%\n"
-        f"Прогноз: {proj.direction}\n"
-        f"{proj.text}\n"
-        f"Стакан: {result.orderbook_bias * 100:+.1f}% · Тренд: {result.trend_bias * 100:+.1f}%"
+        f"Рекомендация: {result.recommendation}\n"
+        f"Прогноз: {proj.direction} · {proj.text}\n"
+        f"Поддержка: {_fmt(result.support.price)} · Сопротивление: {_fmt(result.resistance.price)}\n"
+        f"{fib_lines}\n"
+        f"Стакан: {result.orderbook_bias * 100:+.1f}% · Тренд: {result.trend_bias * 100:+.1f}% · Наклонка: {tl.text}"
     )
     ax.text(
         0.012, 0.965, info,
@@ -698,6 +778,7 @@ from pathlib import Path
 import psutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 
@@ -724,6 +805,19 @@ class TradingBot:
             [InlineKeyboardButton("📚 Стакан ордеров", callback_data="stakan_toggle"), InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
             [InlineKeyboardButton("🖼 Визуализация", callback_data="visualization"), InlineKeyboardButton("🏓 Пинг", callback_data="ping")],
         ])
+
+    async def safe_menu_update(self, query, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+        """Кнопки должны работать и под текстом, и под фото."""
+        try:
+            if query.message.photo:
+                await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text(text, reply_markup=reply_markup)
+        except BadRequest as exc:
+            # Если сообщение без подписи/текст нельзя отредактировать, отправляем новое меню.
+            if "Message is not modified" in str(exc):
+                return
+            await query.message.reply_text(text, reply_markup=reply_markup)
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
@@ -762,6 +856,38 @@ class TradingBot:
             await update.message.reply_text("Монеты в памяти: " + (", ".join(symbols) if symbols else "пусто"))
             return
 
+        if lower in {"top-50", "top 50", "top50"}:
+            await self.load_top_symbols(update, 50)
+            return
+
+        if lower in {"top-100", "top 100", "top100"}:
+            await self.load_top_symbols(update, 100)
+            return
+
+        if lower in {"top-200", "top 200", "top200"}:
+            await self.load_top_symbols(update, 200)
+            return
+
+        if lower.startswith("bot "):
+            arg = lower.split(maxsplit=1)[1]
+            enabled = arg in {"on", "вкл", "1", "true"}
+            self.storage.set_bot_enabled(chat_id, enabled)
+            await update.message.reply_text("Бот: " + ("включен" if enabled else "выключен"), reply_markup=self.main_keyboard())
+            return
+
+        if lower.startswith("auto "):
+            try:
+                minutes = int(lower.split(maxsplit=1)[1])
+            except ValueError:
+                await update.message.reply_text("Формат: auto 10, auto 30, auto 60 или auto 1000")
+                return
+            if minutes not in {10, 30, 60, 1000}:
+                await update.message.reply_text("Доступные интервалы: 10, 30, 60, 1000 минут")
+                return
+            self.storage.set_monitor_interval(chat_id, minutes)
+            await update.message.reply_text(f"Автоотслеживание стакана: каждые {minutes} мин.", reply_markup=self.main_keyboard())
+            return
+
         if lower.startswith("stakan "):
             arg = lower.split(maxsplit=1)[1]
             enabled = arg in {"on", "вкл", "1", "true"}
@@ -773,11 +899,31 @@ class TradingBot:
             await self.add_coin(update, lower.split(maxsplit=1)[1])
             return
 
+        if lower == "del all":
+            self.storage.clear_symbols(chat_id)
+            await update.message.reply_text("Все монеты удалены из памяти.", reply_markup=self.main_keyboard())
+            return
+
         if lower.startswith("del "):
             await self.del_coin(update, lower.split(maxsplit=1)[1])
             return
 
         await self.send_analysis(update, text)
+
+    async def load_top_symbols(self, update: Update, limit: int) -> None:
+        chat_id = update.effective_chat.id
+        try:
+            symbols = self.binance.top_symbols_by_quote_volume(self.config.default_quote, limit)
+            self.storage.replace_symbols(chat_id, symbols)
+            preview = ", ".join(symbols[:12])
+            await update.message.reply_text(
+                f"Загружено в память: топ-{len(symbols)} Binance {self.config.default_quote}.\n"
+                f"Первые монеты: {preview}{'...' if len(symbols) > 12 else ''}",
+                reply_markup=self.main_keyboard(),
+            )
+        except Exception as exc:
+            logging.exception("Top symbols load failed")
+            await update.message.reply_text(f"Не удалось загрузить топ монет: {html.escape(str(exc))}", reply_markup=self.main_keyboard())
 
     async def add_coin(self, update: Update, coin: str) -> None:
         chat_id = update.effective_chat.id
@@ -802,6 +948,9 @@ class TradingBot:
     async def send_analysis(self, update: Update, coin: str) -> None:
         chat_id = update.effective_chat.id
         user = self.storage.get_user(chat_id)
+        if not bool(user.get("bot_enabled", 1)):
+            await update.message.reply_text("Бот выключен. Включите командой `bot on`.", parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard())
+            return
         try:
             symbol = self.binance.normalize_symbol(coin, self.config.default_quote)
             order_book = self.binance.order_book(symbol, self.config.orderbook_limit)
@@ -811,8 +960,8 @@ class TradingBot:
             caption = result.text
 
             if user["visualization"] == "split":
-                await update.message.reply_photo(photo=chart.open("rb"))
-                await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard())
+                # Режим визуализации: весь анализ внутри картинки, без отдельного текста под фото.
+                await update.message.reply_photo(photo=chart.open("rb"), reply_markup=self.main_keyboard())
             else:
                 await update.message.reply_photo(photo=chart.open("rb"), caption=caption[:1024], parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard())
                 if len(caption) > 1024:
@@ -843,47 +992,47 @@ class TradingBot:
             rows = [[InlineKeyboardButton(("✅ " if tf == user["timeframe"] else "") + tf, callback_data=f"tf:{tf}") for tf in TIMEFRAMES[:3]],
                     [InlineKeyboardButton(("✅ " if tf == user["timeframe"] else "") + tf, callback_data=f"tf:{tf}") for tf in TIMEFRAMES[3:]],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="back")]]
-            await query.edit_message_text("Выберите таймфрейм:", reply_markup=InlineKeyboardMarkup(rows))
+            await self.safe_menu_update(query, "Выберите таймфрейм:", reply_markup=InlineKeyboardMarkup(rows))
             return
 
         if data.startswith("tf:"):
             tf = data.split(":", 1)[1]
             if tf in TIMEFRAMES:
                 self.storage.set_timeframe(chat_id, tf)
-            await query.edit_message_text(f"Таймфрейм установлен: {tf}", reply_markup=self.main_keyboard())
+            await self.safe_menu_update(query, f"Таймфрейм установлен: {tf}", reply_markup=self.main_keyboard())
             return
 
         if data == "visualization":
             user = self.storage.get_user(chat_id)
             mode = user["visualization"]
             rows = [
-                [InlineKeyboardButton(("✅ " if mode == "combined" else "") + "Одно сообщение: картинка + анализ", callback_data="vis:combined")],
-                [InlineKeyboardButton(("✅ " if mode == "split" else "") + "Два сообщения: график сверху + текст", callback_data="vis:split")],
+                [InlineKeyboardButton(("✅ " if mode == "combined" else "") + "Картинка + текстовая подпись", callback_data="vis:combined")],
+                [InlineKeyboardButton(("✅ " if mode == "split" else "") + "Весь анализ внутри картинки", callback_data="vis:split")],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
             ]
-            await query.edit_message_text("Режим визуализации:", reply_markup=InlineKeyboardMarkup(rows))
+            await self.safe_menu_update(query, "Режим визуализации:", reply_markup=InlineKeyboardMarkup(rows))
             return
 
         if data.startswith("vis:"):
             mode = data.split(":", 1)[1]
             self.storage.set_visualization(chat_id, mode)
-            label = "одно сообщение" if mode == "combined" else "два сообщения"
-            await query.edit_message_text(f"Визуализация установлена: {label}", reply_markup=self.main_keyboard())
+            label = "картинка + подпись" if mode == "combined" else "весь анализ внутри картинки"
+            await self.safe_menu_update(query, f"Визуализация установлена: {label}", reply_markup=self.main_keyboard())
             return
 
         if data == "stakan_toggle":
             user = self.storage.get_user(chat_id)
             enabled = not bool(user["stakan_enabled"])
             self.storage.set_stakan(chat_id, enabled)
-            await query.edit_message_text("Стакан ордеров: " + ("включен" if enabled else "выключен"), reply_markup=self.main_keyboard())
+            await self.safe_menu_update(query, "Стакан ордеров: " + ("включен" if enabled else "выключен"), reply_markup=self.main_keyboard())
             return
 
         if data == "ping":
-            await query.edit_message_text(self.ping_text(), reply_markup=self.main_keyboard())
+            await self.safe_menu_update(query, self.ping_text(), reply_markup=self.main_keyboard())
             return
 
         if data == "back":
-            await query.edit_message_text("Главное меню", reply_markup=self.main_keyboard())
+            await self.safe_menu_update(query, "Главное меню", reply_markup=self.main_keyboard())
 
     def ping_text(self) -> str:
         process = psutil.Process(os.getpid())
@@ -920,15 +1069,20 @@ from telegram.ext import Application
 
 async def monitor_orderbooks(app: Application, config: Config, storage: Storage, binance: BinanceClient) -> None:
     while True:
-        await asyncio.sleep(config.monitor_interval_minutes * 60)
+        await asyncio.sleep(60)
+        now = int(time.time())
         for chat_id, symbols in storage.enabled_watchlists():
             user = storage.get_user(chat_id)
+            interval_minutes = int(user.get("monitor_interval_minutes") or config.monitor_interval_minutes)
             for symbol in symbols:
                 try:
+                    old, last_check_at = storage.get_snapshot_meta(chat_id, symbol)
+                    if last_check_at and now - last_check_at < interval_minutes * 60:
+                        continue
+
                     order_book = await asyncio.to_thread(binance.order_book, symbol, config.orderbook_limit)
                     signature = compact_orderbook_signature(order_book)
-                    old = storage.get_snapshot(chat_id, symbol)
-                    storage.set_snapshot(chat_id, symbol, signature, int(time.time()))
+                    storage.set_snapshot(chat_id, symbol, signature, now)
                     if not old:
                         continue
                     change = signature_change_percent(old, signature)
@@ -939,14 +1093,17 @@ async def monitor_orderbooks(app: Application, config: Config, storage: Storage,
                     result = analyze(symbol, user["timeframe"], order_book, klines)
                     chart = make_chart(result)
                     text = "🚨 *Сильное изменение стакана*\n" f"Изменение ликвидности: *{change:.1f}%*\n\n" + result.text
-                    await app.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=chart.open("rb"),
-                        caption=text[:1024],
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                    if len(text) > 1024:
-                        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+                    if user.get("visualization") == "split":
+                        await app.bot.send_photo(chat_id=chat_id, photo=chart.open("rb"))
+                    else:
+                        await app.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=chart.open("rb"),
+                            caption=text[:1024],
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        if len(text) > 1024:
+                            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
                     Path(chart).unlink(missing_ok=True)
                 except Exception as exc:
                     await app.bot.send_message(chat_id=chat_id, text=f"Ошибка мониторинга {symbol}: {exc}")
