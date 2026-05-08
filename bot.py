@@ -21,7 +21,7 @@ class Config:
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
     strong_change_threshold: float = 35.0
-    bot_version: str = "00002"
+    bot_version: str = "00003"
 
 
 def get_config() -> Config:
@@ -36,7 +36,7 @@ def get_config() -> Config:
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
         strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00002"),
+        bot_version=os.getenv("BOT_VERSION", "00003"),
     )
 
 # ===== bot/binance_client.py =====
@@ -423,9 +423,36 @@ def fibonacci_levels(df: pd.DataFrame, lookback: int = 160) -> dict[str, float]:
         else:
             start_price, end_price = float(window.loc[high_idx, "high"]), float(window.loc[low_idx, "low"])
 
-    diff = end_price - start_price
     ratios = [("0%", 0.0), ("23.6%", 0.236), ("38.2%", 0.382), ("50%", 0.5), ("61.8%", 0.618), ("78.6%", 0.786), ("100%", 1.0)]
-    return {name: float(start_price + diff * ratio) for name, ratio in ratios}
+
+    # Для восходящего импульса уровни отката считаются от high вниз.
+    # Для нисходящего — от low вверх.
+    if end_price >= start_price:
+        high = float(end_price)
+        low = float(start_price)
+        diff = high - low
+        return {
+            "0%": high,
+            "23.6%": high - diff * 0.236,
+            "38.2%": high - diff * 0.382,
+            "50%": high - diff * 0.5,
+            "61.8%": high - diff * 0.618,
+            "78.6%": high - diff * 0.786,
+            "100%": low,
+        }
+    else:
+        high = float(start_price)
+        low = float(end_price)
+        diff = high - low
+        return {
+            "0%": low,
+            "23.6%": low + diff * 0.236,
+            "38.2%": low + diff * 0.382,
+            "50%": low + diff * 0.5,
+            "61.8%": low + diff * 0.618,
+            "78.6%": low + diff * 0.786,
+            "100%": high,
+        }
 
 def _pivot_points(series: pd.Series, window: int, mode: str) -> list[tuple[int, float]]:
     values = series.to_numpy(dtype=float)
@@ -706,9 +733,9 @@ def make_chart(result: AnalysisResult) -> Path:
         facecolor="#0b1220",
         figcolor="#08111f",
         rc={
-            "font.size": 16,
+            "font.size": 14,
             "axes.labelsize": 15,
-            "axes.titlesize": 22,
+            "axes.titlesize": 20,
             "xtick.labelsize": 14,
             "ytick.labelsize": 14,
         },
@@ -727,7 +754,7 @@ def make_chart(result: AnalysisResult) -> Path:
         xrotation=0,
         warn_too_much_data=300,
     )
-    fig.subplots_adjust(left=0.045, right=0.80, top=0.88, bottom=0.24, hspace=0.05)
+    fig.subplots_adjust(left=0.04, right=0.90, top=0.92, bottom=0.10, hspace=0.03)
     ax = axes[0]
     vol_ax = axes[2] if len(axes) > 2 else axes[-1]
 
@@ -739,10 +766,11 @@ def make_chart(result: AnalysisResult) -> Path:
     ax.axhline(result.resistance.price, color="#f43f5e", linewidth=2.4, linestyle="-", alpha=0.95)
 
     right_x = len(df) - 1
+    label_x = len(df) + 2.0
     ax.axhline(result.price, color="#38bdf8", linewidth=2.0, linestyle="-", alpha=0.9)
-    ax.text(right_x + 1, result.price, f"  ТЕКУЩАЯ ЦЕНА {_fmt(result.price)}", color="#38bdf8", va="center", fontsize=14, fontweight="bold")
-    ax.text(right_x + 1, result.support.price, f"  SUPPORT стакан {_fmt(result.support.price)}", color="#22c55e", va="center", fontsize=14, fontweight="bold")
-    ax.text(right_x + 1, result.resistance.price, f"  RESISTANCE стакан {_fmt(result.resistance.price)}", color="#f43f5e", va="center", fontsize=14, fontweight="bold")
+    ax.text(label_x, result.price, f"  ТЕКУЩАЯ ЦЕНА {_fmt(result.price)}", color="#38bdf8", va="center", fontsize=14, fontweight="bold")
+    ax.text(label_x, result.support.price, f"  SUPPORT стакан {_fmt(result.support.price)}", color="#22c55e", va="center", fontsize=14, fontweight="bold")
+    ax.text(label_x, result.resistance.price, f"  RESISTANCE стакан {_fmt(result.resistance.price)}", color="#f43f5e", va="center", fontsize=14, fontweight="bold")
 
     # Fibonacci по выбранному таймфрейму.
     fib_colors = {
@@ -757,7 +785,7 @@ def make_chart(result: AnalysisResult) -> Path:
     for name, level in result.fib_levels.items():
         color = fib_colors.get(name, "#94a3b8")
         ax.axhline(level, color=color, linewidth=1.35, linestyle="--", alpha=0.82)
-        ax.text(right_x + 1, level, f"  Fib {name}  {_fmt(level)}", color=color, va="center", fontsize=13, fontweight="bold")
+        ax.text(label_x, level, f"  Fib {name}  {_fmt(level)}", color=color, va="center", fontsize=13, fontweight="bold")
 
     # Две наклонные структуры: повышающиеся минимумы и понижающиеся максимумы.
     support_line = _build_trendline(result.df, mode="low", lookback=len(df))
@@ -767,15 +795,15 @@ def make_chart(result: AnalysisResult) -> Path:
         slope = (tl.end_price - tl.start_price) / max(tl.end_index - tl.start_index, 1)
         xs = np.arange(0, len(df), dtype=float)
         ys = np.array([tl.start_price + slope * (x - tl.start_index) for x in xs], dtype=float)
-        ax.plot(xs, ys, color=color, linewidth=3.2, alpha=0.98)
+        ax.plot(xs, ys, color=color, linewidth=1.9, alpha=0.95)
         y_values = df[y_col].to_numpy(dtype=float)
         tolerance = max(float(result.price) * 0.0035, 1e-12)
         touch_idx = [int(i) for i, v in enumerate(y_values) if abs(v - ys[i]) <= tolerance]
         if len(touch_idx) > 8:
             touch_idx = touch_idx[-8:]
         if touch_idx:
-            ax.scatter(touch_idx, [y_values[i] for i in touch_idx], color=color, s=95, zorder=6, edgecolors="white", linewidths=1.0)
-        ax.text(max(1, len(df) // 3), ys[min(len(ys)-1, max(1, len(df)//3))], label_y, color=color, fontsize=15, fontweight="bold", va="bottom", bbox=dict(boxstyle="round,pad=0.25", facecolor="#0b1220", edgecolor=color, alpha=0.75))
+            ax.scatter(touch_idx, [y_values[i] for i in touch_idx], color=color, s=36, zorder=6, edgecolors="white", linewidths=0.6)
+        ax.text(label_x, ys[-1], label_y, color=color, fontsize=11, fontweight="bold", va="center", ha="left", bbox=dict(boxstyle="round,pad=0.22", facecolor="#0b1220", edgecolor=color, alpha=0.82), clip_on=False)
 
     draw_line_with_touches(support_line, "#22c55e", "low", f"Повышающиеся минимумы · касаний {support_line.touches}")
     draw_line_with_touches(resistance_line, "#ef4444", "high", f"Понижающиеся максимумы · касаний {resistance_line.touches}")
@@ -784,56 +812,56 @@ def make_chart(result: AnalysisResult) -> Path:
     # Прогноз: стрелка и цели движения по ближайшим уровням.
     proj = result.projection
     arrow_color = "#22c55e" if proj.direction == "LONG" else "#ef4444"
-    future_x1 = right_x + 8
-    future_x2 = right_x + 20
+    future_x1 = right_x + 4
+    future_x2 = right_x + 10
     ax.annotate(
         "",
         xy=(future_x1, proj.target_1),
         xytext=(right_x, result.price),
-        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=2.6, linestyle="--"),
+        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.25, linestyle="--"),
         annotation_clip=False,
     )
     ax.annotate(
         "",
         xy=(future_x2, proj.target_2),
         xytext=(future_x1, proj.target_1),
-        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=2.2, linestyle="--"),
+        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.15, linestyle="--"),
         annotation_clip=False,
     )
-    ax.text(future_x1, proj.target_1, f"  Цель 1 {_fmt(proj.target_1)} ({proj.move_1_percent:+.2f}%)", color=arrow_color, fontsize=12, fontweight="bold", va="center")
-    ax.text(future_x2, proj.target_2, f"  Цель 2 {_fmt(proj.target_2)} ({proj.move_2_percent:+.2f}%)", color=arrow_color, fontsize=12, fontweight="bold", va="center")
+    ax.text(label_x, proj.target_1, f"  Цель 1 {_fmt(proj.target_1)} ({proj.move_1_percent:+.2f}%)", color=arrow_color, fontsize=12, fontweight="bold", va="center")
+    ax.text(label_x, proj.target_2, f"  Цель 2 {_fmt(proj.target_2)} ({proj.move_2_percent:+.2f}%)", color=arrow_color, fontsize=12, fontweight="bold", va="center")
     ax.axhline(proj.invalidation, color="#94a3b8", linewidth=1.2, linestyle=":", alpha=0.75)
-    ax.text(1, proj.invalidation, f"Отмена сценария: {_fmt(proj.invalidation)}", color="#cbd5e1", fontsize=10, va="center")
+    ax.text(label_x, proj.invalidation, f"  Отмена: {_fmt(proj.invalidation)}", color="#cbd5e1", fontsize=10, va="center", ha="left", clip_on=False)
 
-    # Информационная панель снизу прямо на фото: в режиме split отдельного текста/caption нет.
-    nearest_fibs = sorted(result.fib_levels.items(), key=lambda x: abs(x[1] - result.price))[:5]
-    fib_lines = "   ".join([f"Fib {k}: {_fmt(v)}" for k, v in nearest_fibs])
+    # Компактный блок вынесен в свободную зону, чтобы не перекрывать свечи.
     info = (
-        f"LONG {result.long_probability:.1f}%   SHORT {result.short_probability:.1f}%   |   {result.recommendation}\n"
-        f"Прогноз: {proj.direction} · {proj.text}\n"
-        f"Поддержка стакана: {_fmt(result.support.price)}   Сопротивление стакана: {_fmt(result.resistance.price)}   Текущая: {_fmt(result.price)}\n"
-        f"{fib_lines}\n"
-        f"Стакан: {result.orderbook_bias * 100:+.1f}%   Тренд: {result.trend_bias * 100:+.1f}%   Наклонка: {tl.text}"
+        f"LONG {result.long_probability:.1f}% / SHORT {result.short_probability:.1f}%\n"
+        f"{proj.direction}: T1 {_fmt(proj.target_1)} → T2 {_fmt(proj.target_2)}\n"
+        f"Стакан {result.orderbook_bias * 100:+.1f}% · Тренд {result.trend_bias * 100:+.1f}%"
     )
-    fig.text(
-        0.045, 0.055, info,
-        fontsize=15,
+    ax.text(
+        0.012, 0.985, info,
+        transform=ax.transAxes,
+        fontsize=11,
         color="white",
-        va="bottom",
-        bbox=dict(boxstyle="round,pad=0.65", facecolor="#0f172a", edgecolor="#334155", alpha=0.96),
+        va="top",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.45", facecolor="#0f172a", edgecolor="#334155", alpha=0.88),
     )
 
     # Чтобы справа поместились подписи, цена и стрелки прогноза.
-    ax.set_xlim(-2, len(df) + 34)
+    ax.set_xlim(-2, len(df) + 14)
     lows = [df["low"].min(), *result.fib_levels.values(), result.support.price, proj.target_1, proj.target_2, proj.invalidation]
     highs = [df["high"].max(), *result.fib_levels.values(), result.resistance.price, proj.target_1, proj.target_2, proj.invalidation]
     ymin, ymax = min(lows), max(highs)
     pad = max((ymax - ymin) * 0.10, result.price * 0.005)
     ax.set_ylim(ymin - pad, ymax + pad)
 
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
     ax.set_ylabel("Цена", color="#cbd5e1")
     vol_ax.set_ylabel("Объем", color="#cbd5e1")
-    fig.text(0.80, 0.025, "Не является финансовой рекомендацией.", color="#94a3b8", fontsize=12)
+    fig.text(0.70, 0.025, "Не является финансовой рекомендацией.", color="#94a3b8", fontsize=12)
 
     fig.savefig(out, dpi=100, facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -866,6 +894,7 @@ class TradingBot:
         app = Application.builder().token(self.config.telegram_token).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("help", self.help_cmd))
+        app.add_handler(CommandHandler("info", self.info_cmd))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_router))
         app.add_handler(CallbackQueryHandler(self.callback_router))
         return app
@@ -882,7 +911,8 @@ class TradingBot:
             [
                 [KeyboardButton("📚 Стакан ордеров"), KeyboardButton("⚙️ Настройки")],
                 [KeyboardButton("🖼 Визуализация"), KeyboardButton("🏓 Пинг")],
-                [KeyboardButton("/help"), KeyboardButton("list")],
+                [KeyboardButton("/help"), KeyboardButton("info")],
+                [KeyboardButton("list")],
             ],
             resize_keyboard=True,
             is_persistent=True,
@@ -913,6 +943,27 @@ class TradingBot:
     async def help_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(self.help_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=self.bottom_menu())
 
+    async def info_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await update.message.reply_text(self.settings_text(chat_id), parse_mode=ParseMode.MARKDOWN, reply_markup=self.bottom_menu())
+
+    def settings_text(self, chat_id: int) -> str:
+        user = self.storage.get_user(chat_id)
+        symbols = self.storage.list_symbols(chat_id)
+        visualization = "весь анализ внутри картинки" if user.get("visualization") == "split" else "картинка + текстовая подпись"
+        auto_status = "on" if bool(user.get("stakan_enabled")) else "off"
+        bot_status = "on" if bool(user.get("bot_enabled", 1)) else "off"
+        coins = ", ".join(symbols) if symbols else "пусто"
+        return (
+            "ℹ️ *Текущие настройки*\n\n"
+            f"🪙 Монеты загруженные/добавленные: `{coins}`\n"
+            f"🤖 Bot: `{bot_status}`\n"
+            f"📚 Auto: `{auto_status}`\n"
+            f"⏱ Auto-сканирование стакана: каждые `{int(user.get('monitor_interval_minutes', 30))}` мин. (`auto {int(user.get('monitor_interval_minutes', 30))}`)\n"
+            f"🕯 Таймфрейм: `{user.get('timeframe', '1h')}`\n"
+            f"🖼 Визуализация: `{visualization}`"
+        )
+
     def help_text(self) -> str:
         return (
             "*Команды бота*\n\n"
@@ -924,6 +975,7 @@ class TradingBot:
             "`del btc` — удалить монету из мониторинга.\n"
             "`del all` — удалить все монеты из памяти.\n"
             "`list` — список монет в памяти.\n"
+            "`info` / `/info` — текущие настройки: монеты, auto, таймфрейм и визуализация.\n"
             "`top-50` — загрузить топ 50 монет Binance USDT.\n"
             "`top-100` — загрузить топ 100 монет Binance USDT.\n"
             "`top-200` — загрузить топ 200 монет Binance USDT.\n\n"
@@ -942,7 +994,8 @@ class TradingBot:
             "⚙️ Настройки — таймфрейм.\n"
             "🖼 Визуализация — картинка+подпись или весь анализ внутри картинки.\n"
             "🏓 Пинг — статус Binance и сервера.\n\n"
-            "`/help` — показать эту справку."
+            "`/help` — показать эту справку.\n"
+            "`/info` — показать текущие настройки."
         )
 
     async def text_router(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -957,6 +1010,9 @@ class TradingBot:
             await update.message.reply_text("Монеты в памяти: " + (", ".join(symbols) if symbols else "пусто"))
             return
 
+        if lower in {"info", "инфо", "настройки info"}:
+            await update.message.reply_text(self.settings_text(chat_id), parse_mode=ParseMode.MARKDOWN, reply_markup=self.bottom_menu())
+            return
 
         if lower in {"📚 стакан ордеров", "стакан ордеров"}:
             user = self.storage.get_user(chat_id)
