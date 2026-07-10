@@ -109,6 +109,11 @@ def _format_price(value: float) -> str:
     return "0" if text in {"", "-0"} else text
 
 
+def _fmt_plain(value: float) -> str:
+    """Plain decimal formatter shared with the single-file runtime."""
+    return _format_price(value)
+
+
 def _ordered_fib_items(fib_levels: dict[str, float]) -> list[tuple[str, float]]:
     return [(name, float(fib_levels[name])) for name in FIB_DISPLAY_SEQUENCE if name in fib_levels]
 
@@ -770,6 +775,43 @@ def _trend_score(df: pd.DataFrame) -> float:
     ema_score = 1.0 if ema_fast > ema_slow else -1.0
     mom_score = float(np.clip(momentum / 3.0, -1, 1))
     return float(np.clip((ema_score + mom_score) / 2, -1, 1))
+
+
+def _timeframe_target_step(interval: str, price: float, df: pd.DataFrame) -> float:
+    """Minimum target distance based on timeframe and recent volatility."""
+    tf_mult = {
+        "1m": 0.003, "3m": 0.004, "5m": 0.005, "15m": 0.008, "30m": 0.010,
+        "1h": 0.015, "2h": 0.020, "4h": 0.030, "6h": 0.040, "8h": 0.045,
+        "12h": 0.055, "1d": 0.080, "3d": 0.120, "1w": 0.180, "1M": 0.250,
+    }.get(interval, 0.020)
+    try:
+        high_low = df["high"] - df["low"]
+        high_close = (df["high"] - df["close"].shift()).abs()
+        low_close = (df["low"] - df["close"].shift()).abs()
+        atr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean().iloc[-1]
+        atr_step = float(atr) if np.isfinite(atr) and atr > 0 else 0.0
+    except Exception:
+        atr_step = 0.0
+    return max(price * tf_mult, atr_step * 0.8, price * 0.002, 1e-12)
+
+
+def _unique_targets(candidates: list[float], start: float, direction: str, step: float, count: int = 2) -> list[float]:
+    targets: list[float] = []
+    last = start
+    ordered = sorted(set(float(x) for x in candidates if np.isfinite(x)), reverse=(direction == "SHORT"))
+    for value in ordered:
+        if direction == "LONG" and value > last + step * 0.35:
+            targets.append(value)
+            last = value
+        elif direction == "SHORT" and value < last - step * 0.35:
+            targets.append(value)
+            last = value
+        if len(targets) >= count:
+            break
+    while len(targets) < count:
+        last = last + step if direction == "LONG" else last - step
+        targets.append(last)
+    return targets
 
 
 def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, resistance: OrderBookLevel, long_probability: float, interval: str, df: pd.DataFrame) -> PriceProjection:

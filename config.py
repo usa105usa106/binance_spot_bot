@@ -14,8 +14,8 @@ class Config:
     default_quote: str = "USDT"
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
-    strong_change_threshold: float = 35.0
-    bot_version: str = "00015"
+    strong_change_threshold: float = 20.0
+    bot_version: str = "00016"
 
 
 def get_config() -> Config:
@@ -29,6 +29,6 @@ def get_config() -> Config:
         default_quote=os.getenv("DEFAULT_QUOTE", "USDT").upper(),
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
-        strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00015"),
+        strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "20")),
+        bot_version=os.getenv("BOT_VERSION", "00016"),
     )

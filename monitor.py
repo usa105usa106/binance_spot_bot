@@ -70,9 +70,21 @@ async def _monitor_one_symbol(
             )
 
             if not old:
+                logger.info(
+                    "AUTO_SCAN_BASELINE chat=%s symbol=%s threshold=%.1f%%",
+                    chat_id, symbol, config.strong_change_threshold,
+                )
                 return
             change = signature_change_percent(old, signature)
-            if change < config.strong_change_threshold:
+            signal = change >= config.strong_change_threshold
+            logger.info(
+                "AUTO_SCAN_CHANGE chat=%s symbol=%s change=%.2f%% threshold=%.2f%% signal=%s "
+                "bid_notional=%.8g->%.8g ask_notional=%.8g->%.8g",
+                chat_id, symbol, change, config.strong_change_threshold, "yes" if signal else "no",
+                float(old.get("bid_notional", 0.0)), float(signature.get("bid_notional", 0.0)),
+                float(old.get("ask_notional", 0.0)), float(signature.get("ask_notional", 0.0)),
+            )
+            if not signal:
                 return
             if not bool(current_user.get("stakan_enabled")) or not bool(current_user.get("bot_enabled", 1)):
                 return

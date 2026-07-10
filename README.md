@@ -34,8 +34,8 @@ TELEGRAM_BOT_TOKEN=ВАШ_ТОКЕН_ОТ_BOTFATHER
 DEFAULT_QUOTE=USDT
 ORDERBOOK_LIMIT=1000
 MONITOR_INTERVAL_MINUTES=30
-STRONG_CHANGE_THRESHOLD=35
-BOT_VERSION=00015
+STRONG_CHANGE_THRESHOLD=20
+BOT_VERSION=00016
 BINANCE_BASE_URL=https://api.binance.com
 BINANCE_BASE_URLS=https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision
 ```
@@ -169,3 +169,13 @@ python bot.py
 - Решение учитывает оба тейка и вероятность направления; слабый план переводится в WAIT только при недостаточном ожидаемом преимуществе.
 - На графике и в текстовом скане показываются `RR TP1`, `RR TP2`, `RR плана` и оценка преимущества в R.
 - Исправления дальних стенок стакана и структурного Fibonacci сохранены без изменений.
+
+## v00016 — auto threshold 20%
+
+- Порог сильного изменения стакана снижен с 35% до 20%.
+- Проверка по-прежнему выполняется по заданному интервалу, Telegram-уведомление отправляется только при изменении `>= 20%`.
+- В `/info` отображается действующий порог.
+- В `/log_full` теперь записываются фактическое изменение каждой монеты, порог и результат `signal=yes/no`; первый снимок отмечается как baseline.
+- `/log_full` удаляет Telegram-токены из старых логов, а `httpx` больше не пишет URL с токеном на уровне INFO.
+- Автопланировщик и логика анализа/Fibonacci/двух тейков не изменялись.
+

@@ -28,8 +28,8 @@ class Config:
     default_quote: str = "USDT"
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
-    strong_change_threshold: float = 35.0
-    bot_version: str = "00015"
+    strong_change_threshold: float = 20.0
+    bot_version: str = "00016"
 
 
 def get_config() -> Config:
@@ -43,8 +43,8 @@ def get_config() -> Config:
         default_quote=os.getenv("DEFAULT_QUOTE", "USDT").upper(),
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
-        strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00015"),
+        strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "20")),
+        bot_version=os.getenv("BOT_VERSION", "00016"),
     )
 
 # ===== bot/binance_client.py =====
@@ -1867,13 +1867,13 @@ class TradingBot:
         tmp_path = Path(tmp.name)
         tmp.close()
         try:
-            with tmp_path.open("wb") as output:
+            token_pattern = re.compile(r"(?i)(?:https://api\.telegram\.org/)?bot\d+:[A-Za-z0-9_-]+")
+            with tmp_path.open("w", encoding="utf-8") as output:
                 for source in sources:
-                    output.write(f"===== {source.name} =====\n".encode("utf-8"))
-                    with source.open("rb") as current:
-                        while chunk := current.read(1024 * 1024):
-                            output.write(chunk)
-                    output.write(b"\n")
+                    output.write(f"===== {source.name} =====\n")
+                    content = source.read_text(encoding="utf-8", errors="replace")
+                    output.write(token_pattern.sub("bot<REDACTED>", content))
+                    output.write("\n")
             with tmp_path.open("rb") as document:
                 await update.message.reply_document(
                     document=document,
@@ -1926,6 +1926,7 @@ class TradingBot:
             f"🤖 Bot: `{bot_status}`\n"
             f"📚 Auto: `{auto_status}`\n"
             f"⏱ Auto-сканирование стакана: каждые `{int(user.get('monitor_interval_minutes', 30))}` мин.\n"
+            f"🚨 Порог сильного изменения: `{self.config.strong_change_threshold:g}%`\n"
             f"✅ Последняя успешная проверка: `{last_scan}`\n"
             f"⏭ Следующая проверка: `{next_scan}`\n"
             f"🕯 Таймфрейм: `{user.get('timeframe', '1h')}`\n"
@@ -2295,9 +2296,21 @@ async def _monitor_one_symbol(
             )
 
             if not old:
+                logger.info(
+                    "AUTO_SCAN_BASELINE chat=%s symbol=%s threshold=%.1f%%",
+                    chat_id, symbol, config.strong_change_threshold,
+                )
                 return
             change = signature_change_percent(old, signature)
-            if change < config.strong_change_threshold:
+            signal = change >= config.strong_change_threshold
+            logger.info(
+                "AUTO_SCAN_CHANGE chat=%s symbol=%s change=%.2f%% threshold=%.2f%% signal=%s "
+                "bid_notional=%.8g->%.8g ask_notional=%.8g->%.8g",
+                chat_id, symbol, change, config.strong_change_threshold, "yes" if signal else "no",
+                float(old.get("bid_notional", 0.0)), float(signature.get("bid_notional", 0.0)),
+                float(old.get("ask_notional", 0.0)), float(signature.get("ask_notional", 0.0)),
+            )
+            if not signal:
                 return
             if not bool(current_user.get("stakan_enabled")) or not bool(current_user.get("bot_enabled", 1)):
                 return
@@ -2419,6 +2432,9 @@ LOG_FILE_PATH = os.getenv("BOT_LOG_FILE", "bot_full.log")
 def configure_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    # httpx logs Telegram request URLs at INFO, and those URLs contain the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     if not any(type(handler) is logging.StreamHandler for handler in root.handlers):
         stream = logging.StreamHandler()
@@ -2448,7 +2464,7 @@ def main() -> None:
         logger.info("Order book monitor supervisor started")
 
     app.post_init = post_init
-    logger.info("Bot version %s starting", config.bot_version)
+    logger.info("Bot version %s starting; strong_change_threshold=%.1f%%", config.bot_version, config.strong_change_threshold)
     app.run_polling(allowed_updates=None)
 
 if __name__ == "__main__":
