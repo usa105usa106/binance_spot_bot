@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -24,6 +26,8 @@ class TrendLine:
     slope_percent: float
     touches: int
     text: str
+    touch_points: list[tuple[int, float]] = field(default_factory=list)
+    valid: bool = True
 
 
 @dataclass
@@ -45,6 +49,9 @@ class AnalysisResult:
     support: OrderBookLevel
     resistance: OrderBookLevel
     fib_levels: dict[str, float]
+    fib_direction: str
+    fib_start_price: float
+    fib_end_price: float
     long_probability: float
     short_probability: float
     orderbook_bias: float
@@ -54,6 +61,64 @@ class AnalysisResult:
     df: pd.DataFrame
     trendline: TrendLine
     projection: PriceProjection
+    fib_start_index: int = 0
+    fib_end_index: int = 0
+
+
+FIB_LEVEL_SEQUENCE = ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
+FIB_DISPLAY_SEQUENCE = ["23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
+FIB_CHART_SEQUENCE = ["38.2%", "50%", "61.8%", "78.6%"]
+FIB_LOOKBACK = 90
+
+
+def _format_price(value: float) -> str:
+    value = float(value)
+    if not math.isfinite(value):
+        return str(value)
+    abs_value = abs(value)
+    if abs_value >= 1000:
+        decimals = 2
+    elif abs_value >= 1:
+        decimals = 4
+    elif abs_value >= 0.01:
+        decimals = 6
+    elif abs_value >= 0.0001:
+        decimals = 8
+    elif abs_value >= 0.000001:
+        decimals = 10
+    else:
+        decimals = 12
+    text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
+
+
+def _ordered_fib_items(fib_levels: dict[str, float]) -> list[tuple[str, float]]:
+    return [(name, float(fib_levels[name])) for name in FIB_DISPLAY_SEQUENCE if name in fib_levels]
+
+
+def _chart_fib_items(fib_levels: dict[str, float]) -> list[tuple[str, float]]:
+    """Четыре стандартных retracement-уровня, всегда в одном порядке."""
+    return [(name, float(fib_levels[name])) for name in FIB_CHART_SEQUENCE if name in fib_levels]
+
+
+def _trade_plan_values(price: float, support: OrderBookLevel, resistance: OrderBookLevel, projection: PriceProjection) -> tuple[float, float, float, float, float]:
+    direction = projection.direction
+    entry = float(price)
+    stop = float(projection.invalidation)
+    if direction == "SHORT":
+        stop = max(stop, float(resistance.price))
+        if float(support.price) < float(price):
+            entry = float(support.price)
+    else:
+        stop = min(stop, float(support.price))
+        if float(resistance.price) > float(price):
+            entry = float(resistance.price)
+    tp1 = float(projection.target_1)
+    tp2 = float(projection.target_2)
+    risk = abs(entry - stop)
+    reward = abs(tp1 - entry)
+    rr = reward / risk if risk > 0 else 0.0
+    return float(entry), float(stop), tp1, tp2, float(rr)
 
 
 def klines_to_df(klines: list[list[Any]]) -> pd.DataFrame:
@@ -93,89 +158,494 @@ def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, 
     return OrderBookLevel(price=cluster_price, volume=float(hist[idx]))
 
 
-def fibonacci_levels(df: pd.DataFrame, lookback: int = 160) -> dict[str, float]:
-    window = df.tail(min(lookback, len(df)))
-    high = float(window["high"].max())
-    low = float(window["low"].min())
-    diff = high - low
-    return {
-        "0%": high,
-        "23.6%": high - diff * 0.236,
-        "38.2%": high - diff * 0.382,
-        "50%": high - diff * 0.5,
-        "61.8%": high - diff * 0.618,
-        "78.6%": high - diff * 0.786,
-        "100%": low,
-    }
+def _fibonacci_move_threshold(window: pd.DataFrame) -> tuple[float, float]:
+    close = window["close"].to_numpy(dtype=float)
+    high = window["high"].to_numpy(dtype=float)
+    low = window["low"].to_numpy(dtype=float)
+    prev_close = np.r_[close[0], close[:-1]]
+    true_range = np.maximum.reduce([high - low, np.abs(high - prev_close), np.abs(low - prev_close)])
+    atr = float(np.nanmedian(true_range[-14:])) if len(true_range) else 0.0
+    price = max(abs(float(close[-1])), 1e-12)
+    return max(atr * 1.5, price * 0.004), max(atr * 0.08, price * 0.00025, 1e-12)
+
+
+def _alternating_structural_pivots(window: pd.DataFrame) -> list[tuple[int, str, float]]:
+    highs = [(i, "high", v) for i, v in _filtered_pivots(window, mode="high", lookback=len(window), window=3)]
+    lows = [(i, "low", v) for i, v in _filtered_pivots(window, mode="low", lookback=len(window), window=3)]
+    events = sorted(highs + lows, key=lambda item: (item[0], 0 if item[1] == "low" else 1))
+    collapsed: list[tuple[int, str, float]] = []
+    for event in events:
+        if not collapsed or collapsed[-1][1] != event[1]:
+            collapsed.append(event)
+            continue
+        prev = collapsed[-1]
+        more_extreme = event[2] > prev[2] if event[1] == "high" else event[2] < prev[2]
+        if more_extreme:
+            collapsed[-1] = event
+    return collapsed
+
+
+def _detect_fibonacci_direction(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> str:
+    """Направление Fibonacci определяется структурой цены, а не стаканом/вероятностью сделки."""
+    window = df.tail(min(lookback, len(df))).reset_index(drop=True)
+    if len(window) < 3:
+        return "LONG" if float(window["close"].iloc[-1]) >= float(window["close"].iloc[0]) else "SHORT"
+
+    highs = _filtered_pivots(window, mode="high", lookback=len(window), window=3)
+    lows = _filtered_pivots(window, mode="low", lookback=len(window), window=3)
+    atr = max(_atr_value(window), abs(float(window["close"].iloc[-1])) * 0.0002, 1e-12)
+    tolerance = atr * 0.12
+
+    high_sign = 0
+    low_sign = 0
+    if len(highs) >= 2:
+        delta = float(highs[-1][1] - highs[-2][1])
+        high_sign = 1 if delta > tolerance else -1 if delta < -tolerance else 0
+    if len(lows) >= 2:
+        delta = float(lows[-1][1] - lows[-2][1])
+        low_sign = 1 if delta > tolerance else -1 if delta < -tolerance else 0
+
+    if high_sign > 0 and low_sign > 0:
+        return "LONG"
+    if high_sign < 0 and low_sign < 0:
+        return "SHORT"
+
+    # При переходной структуре берём последний значимый фактический импульс.
+    min_move, _ = _fibonacci_move_threshold(window)
+    pivots = _alternating_structural_pivots(window)
+    for left, right in zip(reversed(pivots[:-1]), reversed(pivots[1:])):
+        if left[1] == right[1]:
+            continue
+        move = abs(float(right[2] - left[2]))
+        if move < min_move:
+            continue
+        return "LONG" if left[1] == "low" and right[1] == "high" else "SHORT"
+
+    # Без подтверждённых swing-точек используем только движение цены, не стакан.
+    return "LONG" if _trend_score(window) >= 0 else "SHORT"
+
+
+def _best_recent_ordered_fibonacci_move(
+    window: pd.DataFrame,
+    direction: str,
+    min_move: float,
+    tolerance: float,
+    recent_bars: int = 48,
+) -> tuple[int, float, int, float]:
+    """Fallback только по свежему участку; старые экстремумы всего окна не используются."""
+    n = len(window)
+    size = min(max(12, recent_bars), n)
+    offset = n - size
+    recent = window.iloc[offset:].reset_index(drop=True)
+    highs = recent["high"].to_numpy(dtype=float)
+    lows = recent["low"].to_numpy(dtype=float)
+
+    if direction == "LONG":
+        for end in range(size - 1, 0, -1):
+            start = int(np.argmin(lows[:end]))
+            start_price = float(lows[start])
+            end_price = float(highs[end])
+            if end_price - start_price < min_move:
+                continue
+            if float(np.min(lows[end:])) < start_price - tolerance:
+                continue
+            return offset + start, start_price, offset + end, end_price
+        start = int(np.argmin(lows[:-1])) if size > 1 else 0
+        end = start + int(np.argmax(highs[start:]))
+        if end <= start:
+            end = min(size - 1, start + 1)
+        return offset + start, float(lows[start]), offset + end, float(highs[end])
+
+    for end in range(size - 1, 0, -1):
+        start = int(np.argmax(highs[:end]))
+        start_price = float(highs[start])
+        end_price = float(lows[end])
+        if start_price - end_price < min_move:
+            continue
+        if float(np.max(highs[end:])) > start_price + tolerance:
+            continue
+        return offset + start, start_price, offset + end, end_price
+    start = int(np.argmax(highs[:-1])) if size > 1 else 0
+    end = start + int(np.argmin(lows[start:]))
+    if end <= start:
+        end = min(size - 1, start + 1)
+    return offset + start, float(highs[start]), offset + end, float(lows[end])
+
+
+def _select_fibonacci_anchors(df: pd.DataFrame, direction: str, lookback: int = FIB_LOOKBACK) -> tuple[int, float, int, float]:
+    """Выбирает свежий структурный импульс, видимый на графике.
+
+    LONG: подтверждённый swing low → фактический максимум после него.
+    SHORT: подтверждённый swing high → фактический минимум после него.
+    """
+    direction = direction.upper()
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError("direction must be LONG or SHORT")
+    window = df.tail(min(lookback, len(df))).reset_index(drop=True)
+    if window.empty:
+        raise ValueError("cannot calculate Fibonacci on empty dataframe")
+    if len(window) < 8:
+        min_move, tolerance = _fibonacci_move_threshold(window)
+        return _best_recent_ordered_fibonacci_move(window, direction, min_move, tolerance, recent_bars=len(window))
+
+    min_move, tolerance = _fibonacci_move_threshold(window)
+    highs = window["high"].to_numpy(dtype=float)
+    lows = window["low"].to_numpy(dtype=float)
+    max_endpoint_age = max(18, len(window) // 3)
+
+    if direction == "LONG":
+        candidates = _filtered_pivots(window, mode="low", lookback=len(window), window=3)
+        for start_idx, start_price in sorted(candidates, key=lambda item: item[0], reverse=True):
+            if start_idx >= len(window) - 1:
+                continue
+            end_idx = start_idx + int(np.argmax(highs[start_idx:]))
+            end_price = float(highs[end_idx])
+            if len(window) - 1 - end_idx > max_endpoint_age:
+                continue
+            if end_idx <= start_idx or end_price - start_price < min_move:
+                continue
+            if float(np.min(lows[start_idx:end_idx + 1])) < start_price - tolerance:
+                continue
+            if float(np.min(lows[end_idx:])) < start_price - tolerance:
+                continue
+            return int(start_idx), float(start_price), int(end_idx), end_price
+    else:
+        candidates = _filtered_pivots(window, mode="high", lookback=len(window), window=3)
+        for start_idx, start_price in sorted(candidates, key=lambda item: item[0], reverse=True):
+            if start_idx >= len(window) - 1:
+                continue
+            end_idx = start_idx + int(np.argmin(lows[start_idx:]))
+            end_price = float(lows[end_idx])
+            if len(window) - 1 - end_idx > max_endpoint_age:
+                continue
+            if end_idx <= start_idx or start_price - end_price < min_move:
+                continue
+            if float(np.max(highs[start_idx:end_idx + 1])) > start_price + tolerance:
+                continue
+            if float(np.max(highs[end_idx:])) > start_price + tolerance:
+                continue
+            return int(start_idx), float(start_price), int(end_idx), end_price
+
+    return _best_recent_ordered_fibonacci_move(window, direction, min_move, tolerance)
+
+
+def _fibonacci_levels_from_anchors(direction: str, start_price: float, end_price: float) -> tuple[dict[str, float], float, float]:
+    ratios = [
+        ("0%", 0.0), ("23.6%", 0.236), ("38.2%", 0.382),
+        ("50%", 0.5), ("61.8%", 0.618), ("78.6%", 0.786), ("100%", 1.0),
+    ]
+    if direction.upper() == "LONG":
+        low, high = sorted((float(start_price), float(end_price)))
+        return {name: low + (high - low) * ratio for name, ratio in ratios}, low, high
+    low, high = sorted((float(end_price), float(start_price)))
+    return {name: high - (high - low) * ratio for name, ratio in ratios}, high, low
+
+
+def _calculate_fibonacci_details(
+    df: pd.DataFrame,
+    direction: str,
+    lookback: int = FIB_LOOKBACK,
+) -> tuple[dict[str, float], float, float, int, int]:
+    start_idx, start_price, end_idx, end_price = _select_fibonacci_anchors(df, direction, lookback)
+    levels, start, end = _fibonacci_levels_from_anchors(direction, start_price, end_price)
+    return levels, start, end, int(start_idx), int(end_idx)
+
+
+def _calculate_fibonacci(df: pd.DataFrame, direction: str, lookback: int = FIB_LOOKBACK) -> tuple[dict[str, float], float, float]:
+    levels, start, end, _, _ = _calculate_fibonacci_details(df, direction, lookback)
+    return levels, start, end
+
+
+def fibonacci_levels(df: pd.DataFrame, direction: str = "LONG", lookback: int = FIB_LOOKBACK) -> dict[str, float]:
+    levels, _, _ = _calculate_fibonacci(df, direction, lookback)
+    return levels
 
 
 def _pivot_points(series: pd.Series, window: int, mode: str) -> list[tuple[int, float]]:
+    """Локальные экстремумы без дублирования плоских макушек/донышек."""
+    if mode not in {"high", "low"}:
+        raise ValueError("mode must be high or low")
     values = series.to_numpy(dtype=float)
+    if len(values) < window * 2 + 1:
+        return []
     pivots: list[tuple[int, float]] = []
     for i in range(window, len(values) - window):
         local = values[i - window:i + window + 1]
-        if mode == "low" and values[i] == np.min(local):
-            pivots.append((i, float(values[i])))
-        if mode == "high" and values[i] == np.max(local):
-            pivots.append((i, float(values[i])))
+        extreme = float(np.max(local) if mode == "high" else np.min(local))
+        atol = max(abs(extreme) * 1e-12, 1e-15)
+        if not np.isclose(values[i], extreme, rtol=0.0, atol=atol):
+            continue
+        equal_positions = np.flatnonzero(np.isclose(local, extreme, rtol=0.0, atol=atol))
+        # Для плато оставляем одну центральную точку, а не несколько соседних swing-точек.
+        chosen_position = int(equal_positions[len(equal_positions) // 2])
+        if i - window + chosen_position != i:
+            continue
+        pivots.append((i, float(values[i])))
     return pivots
 
 
-def _build_trendline(df: pd.DataFrame, trend_bias: float) -> TrendLine:
-    # При восходящем уклоне строим наклонку по повышающимся минимумам, при нисходящем — по понижающимся максимумам.
-    mode = "low" if trend_bias >= 0 else "high"
-    kind = "support" if mode == "low" else "resistance"
-    label = "наклонная поддержка по минимумам" if mode == "low" else "наклонное сопротивление по максимумам"
-    source = df["low"] if mode == "low" else df["high"]
-    pivots = _pivot_points(source.tail(140).reset_index(drop=True), window=3, mode=mode)
+def _atr_value(df: pd.DataFrame, period: int = 14) -> float:
+    if df.empty:
+        return 0.0
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    prev_close = np.r_[close[0], close[:-1]]
+    true_range = np.maximum.reduce([high - low, np.abs(high - prev_close), np.abs(low - prev_close)])
+    recent = true_range[-min(period, len(true_range)):]
+    return float(np.nanmedian(recent)) if len(recent) else 0.0
 
-    if len(pivots) >= 2:
-        # Берем две наиболее свежие опорные точки с правильной структурой, иначе последние две.
-        chosen = None
-        recent = pivots[-8:]
-        for a in range(len(recent) - 2, -1, -1):
-            p1 = recent[a]
-            for p2 in recent[a + 1:]:
-                rising_lows = mode == "low" and p2[1] >= p1[1]
-                falling_highs = mode == "high" and p2[1] <= p1[1]
-                if rising_lows or falling_highs:
-                    chosen = (p1, p2)
-        if chosen is None:
-            chosen = (pivots[-2], pivots[-1])
-        (i1, y1), (i2, y2) = chosen
+
+def _filtered_pivots(
+    df: pd.DataFrame,
+    mode: str,
+    lookback: int = 90,
+    window: int = 3,
+) -> list[tuple[int, float]]:
+    """Фильтрует мелкий шум: swing должен иметь заметную локальную выраженность относительно ATR."""
+    if df.empty:
+        return []
+    tail_len = min(lookback, len(df))
+    tail = df.tail(tail_len).reset_index(drop=True)
+    source = tail["high"] if mode == "high" else tail["low"]
+    raw = _pivot_points(source, window=window, mode=mode)
+    if len(raw) <= 2:
+        return raw
+
+    price = max(abs(float(tail["close"].iloc[-1])), 1e-12)
+    atr = max(_atr_value(tail), price * 0.0002)
+    min_prominence = max(atr * 0.18, price * 0.00015, 1e-12)
+    values = source.to_numpy(dtype=float)
+    filtered: list[tuple[int, float]] = []
+    radius = max(window * 2, 4)
+    for index, value in raw:
+        left = values[max(0, index - radius):index]
+        right = values[index + 1:min(len(values), index + radius + 1)]
+        if not len(left) or not len(right):
+            continue
+        if mode == "high":
+            prominence = float(value - max(float(np.min(left)), float(np.min(right))))
+        else:
+            prominence = float(min(float(np.max(left)), float(np.max(right))) - value)
+        if prominence >= min_prominence:
+            filtered.append((index, value))
+
+    if len(filtered) < 2:
+        filtered = raw
+
+    # Соседние экстремумы объединяем: для high оставляем самый высокий, для low — самый низкий.
+    deduped: list[tuple[int, float]] = []
+    for point in filtered:
+        if deduped and point[0] - deduped[-1][0] <= max(2, window - 1):
+            prev = deduped[-1]
+            replace = point[1] > prev[1] if mode == "high" else point[1] < prev[1]
+            if replace:
+                deduped[-1] = point
+        else:
+            deduped.append(point)
+    return deduped
+
+
+def _fit_boundary_trendline(
+    df: pd.DataFrame,
+    mode: str,
+    expected_direction: str | None = None,
+    lookback: int = 90,
+) -> dict[str, Any]:
+    """Подбирает линию именно по swing-точкам и запрещает ей проходить сквозь структуру.
+
+    support/low: минимумы не должны оказаться заметно ниже линии.
+    resistance/high: максимумы не должны оказаться заметно выше линии.
+    """
+    if mode not in {"high", "low"}:
+        raise ValueError("mode must be high or low")
+    if df.empty:
+        raise ValueError("cannot build trendline on empty dataframe")
+
+    tail_len = min(lookback, len(df))
+    tail = df.tail(tail_len).reset_index(drop=True)
+    source = tail["high"] if mode == "high" else tail["low"]
+    if tail_len == 1:
+        value = float(source.iloc[0])
+        return {
+            "i1": 0, "y1": value, "i2": 0, "y2": value,
+            "slope": 0.0, "touches": [(0, value)], "score": -1.0,
+            "valid": False, "tolerance": 0.0, "tail_len": 1,
+            "current_value": value,
+        }
+    pivots = _filtered_pivots(tail, mode=mode, lookback=tail_len, window=3)
+    price = max(abs(float(tail["close"].iloc[-1])), 1e-12)
+    atr = max(_atr_value(tail), price * 0.0002)
+    tolerance = max(atr * 0.22, price * 0.00025, 1e-12)
+    recent = pivots[-20:]
+
+    direction_sign = 0
+    if expected_direction == "LONG":
+        direction_sign = 1
+    elif expected_direction == "SHORT":
+        direction_sign = -1
+
+    def search(require_direction: bool) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
+        for a in range(len(recent) - 1):
+            i1, y1 = recent[a]
+            for i2, y2 in recent[a + 1:]:
+                span = i2 - i1
+                if span < 5:
+                    continue
+                slope = (y2 - y1) / span
+                if require_direction and direction_sign and slope * direction_sign <= 0:
+                    continue
+
+                xs = np.arange(i1, tail_len, dtype=float)
+                line = y1 + slope * (xs - i1)
+                actual = source.iloc[i1:].to_numpy(dtype=float)
+                violation = line - actual if mode == "low" else actual - line
+                max_violation = max(float(np.max(violation)), 0.0)
+                violation_count = int(np.sum(violation > tolerance))
+                if violation_count > 0 or max_violation > tolerance:
+                    continue
+
+                touches: list[tuple[int, float]] = []
+                for px, py in pivots:
+                    if px < i1:
+                        continue
+                    line_y = y1 + slope * (px - i1)
+                    if abs(py - line_y) <= tolerance:
+                        touches.append((int(px), float(py)))
+                if len(touches) < 2:
+                    continue
+
+                recency = i2 / max(tail_len - 1, 1)
+                span_score = min(span / max(tail_len - 1, 1), 1.0)
+                score = len(touches) * 1000 + recency * 250 + span_score * 120 - (max_violation / tolerance) * 100
+                if best is None or score > float(best["score"]):
+                    best = {
+                        "i1": int(i1), "y1": float(y1), "i2": int(i2), "y2": float(y2),
+                        "slope": float(slope), "touches": touches, "score": float(score), "valid": True,
+                        "tolerance": float(tolerance), "tail_len": int(tail_len),
+                    }
+        return best
+
+    solution = search(require_direction=True)
+    if solution is None:
+        # Не подделываем направление: если ожидаемая структура отсутствует, ищем лучшую реальную границу.
+        solution = search(require_direction=False)
+
+    if solution is None:
+        if len(recent) >= 2:
+            (i1, y1), (i2, y2) = recent[-2], recent[-1]
+        elif len(recent) == 1:
+            i1, y1 = recent[0]
+            i2, y2 = min(i1 + 1, tail_len - 1), y1
+        else:
+            values = source.to_numpy(dtype=float)
+            i1 = int(np.argmax(values) if mode == "high" else np.argmin(values))
+            y1 = float(values[i1])
+            i2, y2 = min(i1 + 1, tail_len - 1), y1
+        if i2 == i1:
+            i2 = i1 + 1
+        slope = (y2 - y1) / max(i2 - i1, 1)
+        solution = {
+            "i1": int(i1), "y1": float(y1), "i2": int(i2), "y2": float(y2),
+            "slope": float(slope), "touches": [(int(i1), float(y1)), (int(i2), float(y2))],
+            "score": -1.0, "valid": False, "tolerance": float(tolerance), "tail_len": int(tail_len),
+        }
+
+    current_value = float(solution["y1"] + solution["slope"] * ((tail_len - 1) - solution["i1"]))
+    solution["current_value"] = current_value
+    return solution
+
+
+def _select_structural_swings(
+    df: pd.DataFrame,
+    mode: str,
+    bearish: bool,
+    lookback: int = 90,
+    max_points: int = 5,
+) -> list[tuple[int, float]]:
+    expected = "SHORT" if bearish else "LONG"
+    solution = _fit_boundary_trendline(df, mode=mode, expected_direction=expected, lookback=lookback)
+    points = list(solution["touches"])
+    return points[-max_points:]
+
+
+def _find_sh_spikes(
+    df: pd.DataFrame,
+    structural_highs: list[tuple[int, float]],
+    bearish: bool,
+    lookback: int = 160,
+    max_spikes: int = 3,
+) -> list[tuple[int, float]]:
+    if df.empty or not bearish or len(structural_highs) < 2:
+        return []
+    tail_len = min(lookback, len(df))
+    tail = df.tail(tail_len).reset_index(drop=True)
+    pivots = _filtered_pivots(tail, mode="high", lookback=tail_len, window=3)
+    structural_idx = {int(i) for i, _ in structural_highs}
+    x1, y1 = structural_highs[0]
+    x2, y2 = structural_highs[-1]
+    if x2 == x1:
+        return []
+    slope = (y2 - y1) / (x2 - x1)
+    price = max(abs(float(tail["close"].iloc[-1])), 1e-12)
+    threshold = max(_atr_value(tail) * 0.35, price * 0.0005, 1e-12)
+    spikes: list[tuple[int, float, float]] = []
+    for x, y in pivots:
+        if x in structural_idx:
+            continue
+        trend_y = y1 + slope * (x - x1)
+        excess = float(y) - float(trend_y)
+        if excess > threshold:
+            spikes.append((int(x), float(y), excess))
+    spikes = sorted(spikes, key=lambda item: item[2], reverse=True)[:max_spikes]
+    return [(x, y) for x, y, _ in sorted(spikes, key=lambda item: item[0])]
+
+
+def _build_trendline(
+    df: pd.DataFrame,
+    trend_bias: float | None = None,
+    mode: str | None = None,
+    lookback: int = 90,
+    expected_direction: str | None = None,
+) -> TrendLine:
+    bias = float(trend_bias or 0.0)
+    if mode not in {"low", "high"}:
+        mode = "high" if bias < 0 else "low"
+    if expected_direction not in {"LONG", "SHORT"}:
+        expected_direction = "SHORT" if bias < 0 else "LONG"
+
+    solution = _fit_boundary_trendline(df, mode=mode, expected_direction=expected_direction, lookback=lookback)
+    slope = float(solution["slope"])
+    price = max(abs(float(df["close"].iloc[-1])), 1e-12)
+    flat_threshold = max(price * 0.00001, float(solution["tolerance"]) / max(int(solution["tail_len"]), 1) * 0.20)
+    if abs(slope) <= flat_threshold:
+        label = "горизонтальная поддержка по минимумам" if mode == "low" else "горизонтальное сопротивление по максимумам"
+    elif slope > 0:
+        label = "повышающиеся минимумы" if mode == "low" else "повышающиеся максимумы"
     else:
-        # Fallback: линейная регрессия по low/high на видимом участке.
-        source_tail = source.tail(140).reset_index(drop=True)
-        x = np.arange(len(source_tail), dtype=float)
-        slope, intercept = np.polyfit(x, source_tail.to_numpy(dtype=float), 1)
-        i1, i2 = 0, len(source_tail) - 1
-        y1, y2 = float(intercept), float(intercept + slope * i2)
+        label = "понижающиеся минимумы" if mode == "low" else "понижающиеся максимумы"
 
-    if i2 == i1:
-        i2 = i1 + 1
-    slope = (y2 - y1) / (i2 - i1)
-    current_value = float(y1 + slope * ((min(140, len(df)) - 1) - i1))
-    slope_percent = float((current_value / max(y1, 1e-9) - 1) * 100)
-
-    # Количество касаний около линии, чтобы показать надежность наклонки.
-    tail = df.tail(140).reset_index(drop=True)
-    line = np.array([y1 + slope * (i - i1) for i in range(len(tail))], dtype=float)
-    tolerance = max(float(tail["close"].iloc[-1]) * 0.004, 1e-12)
-    touches_source = tail["low"].to_numpy(dtype=float) if mode == "low" else tail["high"].to_numpy(dtype=float)
-    touches = int(np.sum(np.abs(touches_source - line) <= tolerance))
-
+    i1 = int(solution["i1"])
+    y1 = float(solution["y1"])
+    current_value = float(solution["current_value"])
+    slope_percent = float((current_value / max(abs(y1), 1e-12) - 1.0) * 100)
+    touch_points = [(int(x), float(y)) for x, y in solution["touches"]]
+    valid = bool(solution["valid"])
+    suffix = "" if valid else " · мало подтверждённых точек"
     return TrendLine(
-        kind=kind,
-        start_index=int(i1),
-        start_price=float(y1),
-        end_index=int(len(tail) - 1),
-        end_price=float(current_value),
+        kind="support" if mode == "low" else "resistance",
+        start_index=i1,
+        start_price=y1,
+        end_index=int(solution["tail_len"] - 1),
+        end_price=current_value,
         current_value=current_value,
         slope_percent=slope_percent,
-        touches=touches,
-        text=f"{label}: {current_value:.6g} ({slope_percent:+.2f}%, касаний: {touches})",
+        touches=len(touch_points),
+        text=f"{label}: {_format_price(current_value)} ({slope_percent:+.2f}%, касаний: {len(touch_points)}){suffix}",
+        touch_points=touch_points,
+        valid=valid,
     )
-
 
 def _trend_score(df: pd.DataFrame) -> float:
     close = df["close"]
@@ -196,13 +666,13 @@ def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, r
         t2 = above[1] if len(above) > 1 else t1 * 1.012
         inv = below[-1] if below else price * 0.985
         direction = "LONG"
-        text = f"При удержании поддержки цель: {t1:.6g} → {t2:.6g}; отмена ниже {inv:.6g}"
+        text = f"При удержании поддержки цель: {_format_price(t1)} → {_format_price(t2)}; отмена ниже {_format_price(inv)}"
     else:
         t1 = below[-1] if below else price * 0.985
         t2 = below[-2] if len(below) > 1 else t1 * 0.988
         inv = above[0] if above else price * 1.015
         direction = "SHORT"
-        text = f"При пробое вниз цель: {t1:.6g} → {t2:.6g}; отмена выше {inv:.6g}"
+        text = f"При пробое вниз цель: {_format_price(t1)} → {_format_price(t2)}; отмена выше {_format_price(inv)}"
     return PriceProjection(
         direction=direction,
         target_1=float(t1),
@@ -219,7 +689,6 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
     price = float(df["close"].iloc[-1])
     support = _aggregate_levels(order_book.get("bids", []), price, "bid")
     resistance = _aggregate_levels(order_book.get("asks", []), price, "ask")
-    fibs = fibonacci_levels(df)
 
     bid_notional = sum(float(p) * float(q) for p, q in order_book.get("bids", [])[:300])
     ask_notional = sum(float(p) * float(q) for p, q in order_book.get("asks", [])[:300])
@@ -236,6 +705,8 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
     combined = 0.40 * orderbook_bias + 0.30 * trend_bias + 0.18 * structure_bias + 0.12 * trendline_bias
     long_probability = float(np.clip(50 + combined * 45, 5, 95))
     short_probability = 100 - long_probability
+    fib_direction = _detect_fibonacci_direction(df, lookback=FIB_LOOKBACK)
+    fibs, fib_start_price, fib_end_price, fib_start_index, fib_end_index = _calculate_fibonacci_details(df, fib_direction, lookback=FIB_LOOKBACK)
     projection = _projection(price, fibs, support, resistance, long_probability)
 
     if long_probability >= 58:
@@ -245,18 +716,25 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
     else:
         recommendation = "NEUTRAL / нет сильного перевеса, ждать подтверждения"
 
-    nearest_fibs = sorted(fibs.items(), key=lambda x: abs(x[1] - price))[:4]
-    fib_text = "\n".join([f"• Fib {k}: `{v:.6g}`" for k, v in nearest_fibs])
+    entry, stop, tp1, tp2, rr = _trade_plan_values(price, support, resistance, projection)
+    ordered_fibs = _ordered_fib_items(fibs)
+    fib_text = "\n".join([f"• Fib {k}: `{_format_price(v)}`" for k, v in ordered_fibs])
     text = (
         f"📊 *{symbol}* · TF `{interval}`\n"
-        f"Цена: `{price:.6g}`\n\n"
-        f"🟢 Поддержка по стакану: `{support.price:.6g}` · ликвидность `{support.volume:,.0f}`\n"
-        f"🔴 Сопротивление по стакану: `{resistance.price:.6g}` · ликвидность `{resistance.volume:,.0f}`\n"
+        f"Цена: `{_format_price(price)}`\n\n"
+        f"🟢 Поддержка по стакану: `{_format_price(support.price)}` · ликвидность `{support.volume:,.0f}`\n"
+        f"🔴 Сопротивление по стакану: `{_format_price(resistance.price)}` · ликвидность `{resistance.volume:,.0f}`\n"
         f"📐 Наклонка: `{trendline.text}`\n\n"
-        f"📏 Ближайшие Fibonacci:\n{fib_text}\n\n"
+        f"📏 Fibonacci {fib_direction} по структуре: `{_format_price(fib_start_price)}` → `{_format_price(fib_end_price)}`\n"
+        f"Уровни по порядку:\n{fib_text}\n\n"
         f"📈 Проходимость LONG: *{long_probability:.1f}%*\n"
         f"📉 Проходимость SHORT: *{short_probability:.1f}%*\n"
         f"🎯 Прогноз движения: `{projection.text}`\n"
+        f"📌 Торговый план {projection.direction}:\n"
+        f"Вход: `{_format_price(entry)}`\n"
+        f"Стоп: `{_format_price(stop)}`\n"
+        f"Цели:\n1) `{_format_price(tp1)}`\n2) `{_format_price(tp2)}`\n"
+        f"RR TP1: `{rr:.2f}`\n"
         f"⚖️ Дисбаланс стакана: `{orderbook_bias * 100:.1f}%`\n"
         f"🧭 Тренд: `{trend_bias * 100:.1f}%`\n\n"
         f"✅ Рекомендация: *{recommendation}*\n\n"
@@ -270,6 +748,9 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
         support=support,
         resistance=resistance,
         fib_levels=fibs,
+        fib_direction=fib_direction,
+        fib_start_price=fib_start_price,
+        fib_end_price=fib_end_price,
         long_probability=long_probability,
         short_probability=short_probability,
         orderbook_bias=orderbook_bias,
@@ -279,6 +760,8 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
         df=df,
         trendline=trendline,
         projection=projection,
+        fib_start_index=fib_start_index,
+        fib_end_index=fib_end_index,
     )
 
 
@@ -297,4 +780,4 @@ def signature_change_percent(old: dict[str, float], new: dict[str, float]) -> fl
     for key in ["bid_notional", "ask_notional"]:
         base = max(abs(old.get(key, 0.0)), 1e-9)
         values.append(abs(new.get(key, 0.0) - old.get(key, 0.0)) / base * 100)
-    return float(max(values))
+    return float(max(values)) if values else 0.0

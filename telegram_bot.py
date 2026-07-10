@@ -6,15 +6,22 @@ import time
 from pathlib import Path
 
 import psutil
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from .analysis import analyze
-from .binance_client import BinanceClient
-from .charting import make_chart
-from .config import Config
-from .storage import Storage
+try:
+    from .analysis import analyze
+    from .binance_client import BinanceClient
+    from .charting import make_chart
+    from .config import Config
+    from .storage import Storage
+except ImportError:  # direct module execution / Railway root
+    from analysis import analyze
+    from binance_client import BinanceClient
+    from charting import make_chart
+    from config import Config
+    from storage import Storage
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d", "1w"]
 START_TIME = time.time()

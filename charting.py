@@ -1,24 +1,41 @@
 from __future__ import annotations
 
+import math
 import tempfile
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import mplfinance as mpf
-import numpy as np
 
-from .analysis import AnalysisResult
+try:
+    from .analysis import AnalysisResult, _chart_fib_items
+except ImportError:  # direct module execution / Railway root
+    from analysis import AnalysisResult, _chart_fib_items
 
 
 def _fmt(value: float) -> str:
-    if abs(value) >= 1000:
-        return f"{value:,.2f}"
-    if abs(value) >= 1:
-        return f"{value:.4f}"
-    return f"{value:.8f}".rstrip("0")
+    value = float(value)
+    if not math.isfinite(value):
+        return str(value)
+    abs_value = abs(value)
+    if abs_value >= 1000:
+        decimals = 2
+    elif abs_value >= 1:
+        decimals = 4
+    elif abs_value >= 0.01:
+        decimals = 6
+    elif abs_value >= 0.0001:
+        decimals = 8
+    elif abs_value >= 0.000001:
+        decimals = 10
+    else:
+        decimals = 12
+    text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
 
 
-def make_chart(result: AnalysisResult) -> Path:
+def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) -> Path:
     """Создает крупный, читаемый PNG 1920x1080 с уровнями Fib, стаканом, наклонкой и прогнозом."""
     df = result.df.tail(140).copy()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -58,6 +75,8 @@ def make_chart(result: AnalysisResult) -> Path:
     fig.subplots_adjust(left=0.055, right=0.86, top=0.90, bottom=0.11, hspace=0.06)
     ax = axes[0]
     vol_ax = axes[2] if len(axes) > 2 else axes[-1]
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: _fmt(value)))
+    ax.yaxis.offsetText.set_visible(False)
 
     title = f"{result.symbol} · BINANCE SPOT · TF {result.interval} · цена {_fmt(result.price)}"
     ax.set_title(title, loc="left", color="white", pad=18, fontsize=21, fontweight="bold")
@@ -80,7 +99,10 @@ def make_chart(result: AnalysisResult) -> Path:
         "78.6%": "#60a5fa",
         "100%": "#e5e7eb",
     }
-    for name, level in result.fib_levels.items():
+    for name in ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]:
+        if name not in result.fib_levels:
+            continue
+        level = result.fib_levels[name]
         color = fib_colors.get(name, "#94a3b8")
         ax.axhline(level, color=color, linewidth=1.35, linestyle="--", alpha=0.82)
         ax.text(right_x + 1, level, f"  Fib {name}  {_fmt(level)}", color=color, va="center", fontsize=11, fontweight="bold")
@@ -120,6 +142,7 @@ def make_chart(result: AnalysisResult) -> Path:
     info = (
         f"LONG {result.long_probability:.1f}%  |  SHORT {result.short_probability:.1f}%\n"
         f"Прогноз: {proj.direction}\n"
+        f"Фибо {result.fib_direction}: {_fmt(result.fib_start_price)} → {_fmt(result.fib_end_price)}\n"
         f"{proj.text}\n"
         f"Стакан: {result.orderbook_bias * 100:+.1f}% · Тренд: {result.trend_bias * 100:+.1f}%"
     )

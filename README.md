@@ -35,7 +35,7 @@ DEFAULT_QUOTE=USDT
 ORDERBOOK_LIMIT=1000
 MONITOR_INTERVAL_MINUTES=30
 STRONG_CHANGE_THRESHOLD=35
-BOT_VERSION=00007
+BOT_VERSION=00012
 BINANCE_BASE_URL=https://api.binance.com
 BINANCE_BASE_URLS=https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision
 ```
@@ -121,3 +121,38 @@ python bot.py
 
 ### Binance 451/403
 Бот автоматически перебирает резервные endpoints Binance (`api1`-`api4` и `data-api.binance.vision`) и больше не отправляет пользователю сырые ошибки с URL/JSON-превью. При необходимости укажите свои endpoints в `BINANCE_BASE_URLS` через запятую.
+
+## Fibonacci — первоначальное исправление v00008–v00010
+
+- Направление расчета Fibonacci теперь совпадает с текущим сценарием LONG/SHORT.
+- LONG строится от актуального swing low до фактического максимума после него.
+- SHORT строится от актуального swing high до фактического минимума после него.
+- Локальный якорь, уже пробитый обратным движением, отбрасывается; бот берет предыдущий действующий структурный экстремум.
+- В сообщении и на графике показывается диапазон, по которому рассчитаны уровни: `Фибо LONG/SHORT: начало → конец`.
+- Уровни имеют единое направление: `0%` — начало импульса, `100%` — конец импульса.
+
+
+## v00010 — trendline, auto scheduler, /log_full
+
+- Наклонные линии строятся только по подтверждённым Swing High/Swing Low, фильтруют микрошум и не проходят сквозь реальные экстремумы свечей.
+- Для поддержки и сопротивления считаются настоящие касания swing-точек; линия с недостаточным подтверждением помечается как неподтверждённая.
+- `auto N` одновременно включает автоотслеживание и немедленно ставит первый скан в очередь.
+- Для каждого тикера хранится отдельное `next_check_at`; интервал отсчитывается от начала проверки и больше не накапливает сетевую задержку.
+- Планировщик не блокируется медленным тикером, не запускает дубликаты и после исключения продолжает работать; ошибки получают retry 30–300 секунд.
+- Исправлена утечка SQLite-соединений, которая при долгой работе могла расходовать файловые дескрипторы и память.
+- `/info` показывает последнюю успешную проверку, следующую проверку и последнюю ошибку.
+- `/log_full` объединяет активный и ротационные логи с полными traceback ошибок.
+
+
+## v00011 — scan layout
+
+- Добавлены вход, стоп, цели и RR в текстовый скан.
+- Подписи уровней вынесены вправо и разнесены по вертикали.
+
+## v00012 — structural Fibonacci correction
+
+- Fibonacci direction now follows price structure, not order-book probability.
+- Anchors are restricted to the same 90-candle window shown on the chart.
+- Removed stale full-window fallback; fallback uses only the latest 48 candles.
+- Chart always shows exactly 38.2%, 50%, 61.8%, and 78.6%.
+- Added visible FIB 0% and FIB 100% anchor markers.
