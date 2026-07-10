@@ -35,7 +35,7 @@ DEFAULT_QUOTE=USDT
 ORDERBOOK_LIMIT=1000
 MONITOR_INTERVAL_MINUTES=30
 STRONG_CHANGE_THRESHOLD=35
-BOT_VERSION=00012
+BOT_VERSION=00015
 BINANCE_BASE_URL=https://api.binance.com
 BINANCE_BASE_URLS=https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision
 ```
@@ -156,3 +156,16 @@ python bot.py
 - Removed stale full-window fallback; fallback uses only the latest 48 candles.
 - Chart always shows exactly 38.2%, 50%, 61.8%, and 78.6%.
 - Added visible FIB 0% and FIB 100% anchor markers.
+
+
+## v00014 — normal-market regression fix
+Сохранена прежняя логика входа/стопа/целей для локальных стенок BTC/ETH; дальние стенки по-прежнему исключаются.
+
+
+## v00015 — two-target RR plan
+
+- Удалён жёсткий запрет сделки только по `RR TP1 < 1`.
+- RR рассчитывается отдельно для TP1, TP2 и всего плана с фиксацией 50% / 50%.
+- Решение учитывает оба тейка и вероятность направления; слабый план переводится в WAIT только при недостаточном ожидаемом преимуществе.
+- На графике и в текстовом скане показываются `RR TP1`, `RR TP2`, `RR плана` и оценка преимущества в R.
+- Исправления дальних стенок стакана и структурного Fibonacci сохранены без изменений.

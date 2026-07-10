@@ -29,7 +29,7 @@ class Config:
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
     strong_change_threshold: float = 35.0
-    bot_version: str = "00012"
+    bot_version: str = "00015"
 
 
 def get_config() -> Config:
@@ -44,7 +44,7 @@ def get_config() -> Config:
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
         strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "35")),
-        bot_version=os.getenv("BOT_VERSION", "00012"),
+        bot_version=os.getenv("BOT_VERSION", "00015"),
     )
 
 # ===== bot/binance_client.py =====
@@ -473,6 +473,20 @@ class PriceProjection:
     move_1_percent: float
     move_2_percent: float
     text: str
+    entry: float = 0.0
+
+
+@dataclass(frozen=True)
+class TradePlanMetrics:
+    entry: float
+    stop: float
+    tp1: float
+    tp2: float
+    risk: float
+    rr_tp1: float
+    rr_tp2: float
+    rr_plan: float
+    valid_geometry: bool
 
 
 @dataclass
@@ -503,6 +517,9 @@ FIB_LEVEL_SEQUENCE = ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
 FIB_DISPLAY_SEQUENCE = ["23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
 FIB_CHART_SEQUENCE = ["38.2%", "50%", "61.8%", "78.6%"]
 FIB_LOOKBACK = 90
+TP1_POSITION_SHARE = 0.50
+TP2_POSITION_SHARE = 0.50
+MIN_PLAN_EXPECTANCY_R = 0.05
 
 
 def _fmt_plain(value: float) -> str:
@@ -557,24 +574,101 @@ def _spread_label_positions(items: list[dict[str, float | str]], min_gap: float,
     return ordered
 
 
-def _trade_plan_values(price: float, support: OrderBookLevel, resistance: OrderBookLevel, projection: PriceProjection) -> tuple[float, float, float, float, float]:
-    direction = projection.direction
-    entry = float(price)
+def _trade_plan_metrics(
+    price: float,
+    support: OrderBookLevel,
+    resistance: OrderBookLevel,
+    projection: PriceProjection,
+) -> TradePlanMetrics:
+    """Единый расчёт риска и RR для двух целей.
+
+    TP1 и TP2 считаются как две половины позиции. Геометрия проверяется
+    направленно, поэтому модуль разницы не может скрыть перепутанный стоп/тейк.
+    """
+    del support, resistance  # уровни уже провалидированы и записаны в projection
+    entry = float(projection.entry) if float(getattr(projection, "entry", 0.0) or 0.0) > 0 else float(price)
     stop = float(projection.invalidation)
-    if direction == "SHORT":
-        stop = max(stop, float(resistance.price))
-        if float(support.price) < float(price):
-            entry = float(support.price)
-    else:
-        stop = min(stop, float(support.price))
-        if float(resistance.price) > float(price):
-            entry = float(resistance.price)
     tp1 = float(projection.target_1)
     tp2 = float(projection.target_2)
-    risk = abs(entry - stop)
-    reward = abs(tp1 - entry)
-    rr = reward / risk if risk > 0 else 0.0
-    return float(entry), float(stop), tp1, tp2, float(rr)
+    direction = str(projection.direction).upper()
+
+    finite = all(math.isfinite(v) and v > 0 for v in (entry, stop, tp1, tp2))
+    if direction == "LONG":
+        valid_geometry = finite and stop < entry < tp1 < tp2
+        reward_1 = tp1 - entry
+        reward_2 = tp2 - entry
+    elif direction == "SHORT":
+        valid_geometry = finite and stop > entry > tp1 > tp2
+        reward_1 = entry - tp1
+        reward_2 = entry - tp2
+    else:
+        valid_geometry = False
+        reward_1 = 0.0
+        reward_2 = 0.0
+
+    risk = abs(entry - stop) if finite else 0.0
+    if risk <= 1e-15:
+        valid_geometry = False
+        rr_tp1 = 0.0
+        rr_tp2 = 0.0
+    else:
+        rr_tp1 = max(float(reward_1), 0.0) / risk
+        rr_tp2 = max(float(reward_2), 0.0) / risk
+
+    total_share = TP1_POSITION_SHARE + TP2_POSITION_SHARE
+    if total_share <= 0:
+        rr_plan = 0.0
+        valid_geometry = False
+    else:
+        rr_plan = (TP1_POSITION_SHARE * rr_tp1 + TP2_POSITION_SHARE * rr_tp2) / total_share
+
+    return TradePlanMetrics(
+        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk=float(risk),
+        rr_tp1=float(rr_tp1), rr_tp2=float(rr_tp2), rr_plan=float(rr_plan),
+        valid_geometry=bool(valid_geometry),
+    )
+
+
+def _trade_plan_values(
+    price: float, support: OrderBookLevel, resistance: OrderBookLevel, projection: PriceProjection
+) -> tuple[float, float, float, float, float]:
+    """Совместимый старый интерфейс: последний элемент — RR до TP1."""
+    metrics = _trade_plan_metrics(price, support, resistance, projection)
+    return metrics.entry, metrics.stop, metrics.tp1, metrics.tp2, metrics.rr_tp1
+
+
+def _plan_expectancy_r(metrics: TradePlanMetrics, direction_probability: float) -> float:
+    """Оценка преимущества плана в R с учётом обоих тейков 50/50.
+
+    Это фильтр качества текущей модели, а не обещание реальной доходности.
+    """
+    probability = float(np.clip(direction_probability / 100.0, 0.0, 1.0))
+    return float(probability * metrics.rr_plan - (1.0 - probability))
+
+
+def _apply_trade_plan_filter(
+    recommendation: str,
+    projection: PriceProjection,
+    metrics: TradePlanMetrics,
+    long_probability: float,
+    short_probability: float,
+) -> tuple[str, float]:
+    """Не блокирует сделку из-за одного TP1; оценивает весь план."""
+    direction_probability = long_probability if projection.direction == "LONG" else short_probability
+    expectancy_r = _plan_expectancy_r(metrics, direction_probability)
+
+    # NEUTRAL уже означает отсутствие сильного направления — RR не должен превращать его в сделку.
+    if recommendation.startswith("NEUTRAL"):
+        return recommendation, expectancy_r
+    if not metrics.valid_geometry:
+        return "WAIT / некорректная геометрия входа, стопа или целей", expectancy_r
+    if expectancy_r < MIN_PLAN_EXPECTANCY_R:
+        return (
+            f"WAIT / слабый план: RR плана {metrics.rr_plan:.2f}, "
+            f"оценка {expectancy_r:+.2f}R",
+            expectancy_r,
+        )
+    return recommendation, expectancy_r
 
 
 def klines_to_df(klines: list[list[Any]]) -> pd.DataFrame:
@@ -594,7 +688,7 @@ def klines_to_df(klines: list[list[Any]]) -> pd.DataFrame:
 
 def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, bins: int = 45) -> OrderBookLevel:
     parsed = np.array([[float(p), float(q)] for p, q in levels if float(q) > 0], dtype=float)
-    if parsed.size == 0:
+    if parsed.size == 0 or current_price <= 0:
         return OrderBookLevel(current_price, 0.0)
     if side == "bid":
         parsed = parsed[parsed[:, 0] < current_price]
@@ -603,15 +697,36 @@ def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, 
     if len(parsed) == 0:
         return OrderBookLevel(current_price, 0.0)
 
-    prices = parsed[:, 0]
-    quantities = parsed[:, 1]
+    # Стакан может содержать огромную далёкую стенку. Она не является рабочим
+    # уровнем для текущего входа и не должна ломать масштаб графика.
+    distances = np.abs(parsed[:, 0] / current_price - 1.0)
+    local = parsed[distances <= 0.03]  # рабочая зона: не дальше 5% от рынка
+    if len(local) < 3:
+        nearest_order = np.argsort(distances)
+        nearest_distance = float(distances[nearest_order[0]])
+        if nearest_distance > 0.10:
+            return OrderBookLevel(current_price, 0.0)
+        local = parsed[nearest_order[: min(40, len(parsed))]]
+        local_distances = np.abs(local[:, 0] / current_price - 1.0)
+        local = local[local_distances <= 0.10]
+    if len(local) == 0:
+        return OrderBookLevel(current_price, 0.0)
+
+    prices = local[:, 0]
+    quantities = local[:, 1]
     notional = prices * quantities
-    hist, edges = np.histogram(prices, bins=min(bins, max(8, len(parsed) // 7)), weights=notional)
+    hist, edges = np.histogram(prices, bins=min(bins, max(8, len(local) // 7)), weights=notional)
     idx = int(np.argmax(hist))
     left, right = edges[idx], edges[idx + 1]
     mask = (prices >= left) & (prices <= right)
     cluster_price = float(np.average(prices[mask], weights=notional[mask])) if mask.any() else float(prices[np.argmax(notional)])
     return OrderBookLevel(price=cluster_price, volume=float(hist[idx]))
+
+
+def _level_is_local(level_price: float, current_price: float, max_distance: float = 0.04) -> bool:
+    if current_price <= 0 or level_price <= 0:
+        return False
+    return abs(level_price / current_price - 1.0) <= max_distance
 
 
 def _fibonacci_move_threshold(window: pd.DataFrame) -> tuple[float, float]:
@@ -1150,28 +1265,60 @@ def _unique_targets(candidates: list[float], start: float, direction: str, step:
 
 
 def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, resistance: OrderBookLevel, long_probability: float, interval: str, df: pd.DataFrame) -> PriceProjection:
-    # Цели LONG/SHORT не должны совпадать с поддержкой/сопротивлением.
-    # Дистанция целей учитывает выбранный таймфрейм и ATR, чтобы на 15m цели были ближе, а на 1d/1w дальше.
-    levels = sorted(set([*fibs.values(), support.price, resistance.price]))
+    """Строит торговый план, сохраняя нормальную логику для BTC/ETH и отсекая только дальние стенки.
+
+    Важное правило: локальные уровни стакана обрабатываются по прежней логике,
+    а не локальные исключаются до расчёта. Поэтому DOGS с далёкой стенкой не ломает
+    масштаб/вход, но близкие уровни ETH/BTC продолжают давать прежние entry/SL/TP.
+    """
     step = _timeframe_target_step(interval, price, df)
     min_gap = max(step * 0.35, price * 0.0015, 1e-12)
+    trigger_limit = max(step * 1.75, price * 0.025)
+
+    support_local = support.price < price and _level_is_local(support.price, price, 0.04)
+    resistance_local = resistance.price > price and _level_is_local(resistance.price, price, 0.04)
+    support_trade = support_local and (price - support.price) <= trigger_limit
+    resistance_trade = resistance_local and (resistance.price - price) <= trigger_limit
+
+    effective_support = float(support.price) if support_trade else float(price)
+    effective_resistance = float(resistance.price) if resistance_trade else float(price)
+    levels = list(float(v) for v in fibs.values() if np.isfinite(v) and v > 0)
+    if support_trade:
+        levels.append(effective_support)
+    if resistance_trade:
+        levels.append(effective_resistance)
+    levels = sorted(set(levels))
+
     if long_probability >= 50:
-        trigger = max(price, resistance.price)
-        # LONG-цели берём только выше точки входа/сопротивления; если уровней нет — строим по волатильности таймфрейма.
-        candidates = [v for v in levels if v > trigger + min_gap]
-        t1, t2 = _unique_targets(candidates, trigger, "LONG", step, 2)
-        inv_candidates = [v for v in levels if v < min(price, support.price) - min_gap]
-        inv = inv_candidates[-1] if inv_candidates else min(price, support.price) - step * 0.8
+        entry = max(float(price), effective_resistance)
+        candidates = [v for v in levels if v > entry + min_gap]
+        t1, t2 = _unique_targets(candidates, entry, "LONG", step, 2)
+
+        # Сохраняем прежнюю логику стопа для нормальных локальных уровней:
+        # ближайший уровень ниже самой нижней из точек market/support с запасом min_gap.
+        stop_reference = min(float(price), effective_support)
+        inv_candidates = [v for v in levels if v < stop_reference - min_gap]
+        inv = inv_candidates[-1] if inv_candidates else stop_reference - step * 0.8
+
+        # Только аварийный предел от абсурдно далёкого стопа.
+        floor = price - max(step * 4.0, price * 0.08)
+        inv = max(inv, floor)
         direction = "LONG"
-        text = f"При пробое/удержании выше {_fmt_plain(trigger)} цель: {_fmt_plain(t1)} → {_fmt_plain(t2)}; отмена ниже {_fmt_plain(inv)}"
+        text = f"При пробое/удержании выше {_fmt_plain(entry)} цель: {_fmt_plain(t1)} → {_fmt_plain(t2)}; отмена ниже {_fmt_plain(inv)}"
     else:
-        trigger = min(price, support.price)
-        candidates = [v for v in levels if v < trigger - min_gap]
-        t1, t2 = _unique_targets(candidates, trigger, "SHORT", step, 2)
-        inv_candidates = [v for v in levels if v > max(price, resistance.price) + min_gap]
-        inv = inv_candidates[0] if inv_candidates else max(price, resistance.price) + step * 0.8
+        entry = min(float(price), effective_support)
+        candidates = [v for v in levels if v < entry - min_gap]
+        t1, t2 = _unique_targets(candidates, entry, "SHORT", step, 2)
+
+        stop_reference = max(float(price), effective_resistance)
+        inv_candidates = [v for v in levels if v > stop_reference + min_gap]
+        inv = inv_candidates[0] if inv_candidates else stop_reference + step * 0.8
+
+        ceiling = price + max(step * 4.0, price * 0.08)
+        inv = min(inv, ceiling)
         direction = "SHORT"
-        text = f"При пробое поддержки {_fmt_plain(support.price)} вниз цель: {_fmt_plain(t1)} → {_fmt_plain(t2)}; отмена выше {_fmt_plain(inv)}"
+        text = f"При пробое/удержании ниже {_fmt_plain(entry)} цель: {_fmt_plain(t1)} → {_fmt_plain(t2)}; отмена выше {_fmt_plain(inv)}"
+
     return PriceProjection(
         direction=direction,
         target_1=float(t1),
@@ -1180,8 +1327,8 @@ def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, r
         move_1_percent=float((t1 / price - 1) * 100),
         move_2_percent=float((t2 / price - 1) * 100),
         text=text,
+        entry=float(entry),
     )
-
 
 def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list[list[Any]]) -> AnalysisResult:
     df = klines_to_df(klines)
@@ -1215,7 +1362,11 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
     else:
         recommendation = "NEUTRAL / нет сильного перевеса, ждать подтверждения"
 
-    entry, stop, tp1, tp2, rr = _trade_plan_values(price, support, resistance, projection)
+    metrics = _trade_plan_metrics(price, support, resistance, projection)
+    entry, stop, tp1, tp2 = metrics.entry, metrics.stop, metrics.tp1, metrics.tp2
+    recommendation, expectancy_r = _apply_trade_plan_filter(
+        recommendation, projection, metrics, long_probability, short_probability
+    )
     ordered_fibs = _ordered_fib_items(fibs)
     fib_text = "\n".join([f"• Fib {k}: `{_fmt_plain(v)}`" for k, v in ordered_fibs])
     text = (
@@ -1233,7 +1384,10 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
         f"Вход: `{_fmt_plain(entry)}`\n"
         f"Стоп: `{_fmt_plain(stop)}`\n"
         f"Цели:\n1) `{_fmt_plain(tp1)}`\n2) `{_fmt_plain(tp2)}`\n"
-        f"RR TP1: `{rr:.2f}`\n"
+        f"RR TP1: `{metrics.rr_tp1:.2f}`\n"
+        f"RR TP2: `{metrics.rr_tp2:.2f}`\n"
+        f"RR плана 50/50: `{metrics.rr_plan:.2f}`\n"
+        f"Оценка плана: `{expectancy_r:+.2f}R`\n"
         f"⚖️ Дисбаланс стакана: `{orderbook_bias * 100:.1f}%`\n"
         f"🧭 Тренд: `{trend_bias * 100:.1f}%`\n\n"
         f"✅ Рекомендация: *{recommendation}*\n\n"
@@ -1375,10 +1529,11 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
     right_x = len(df) - 1
     label_x_side = len(df) + 7.8
 
-    entry, stop, tp1, tp2, rr = _trade_plan_values(result.price, result.support, result.resistance, result.projection)
+    metrics = _trade_plan_metrics(result.price, result.support, result.resistance, result.projection)
+    entry, stop, tp1, tp2 = metrics.entry, metrics.stop, metrics.tp1, metrics.tp2
+    direction_probability = result.long_probability if direction == "LONG" else result.short_probability
+    expectancy_r = _plan_expectancy_r(metrics, direction_probability)
 
-    ax.axhline(stop, color="#ef4444", linewidth=1.15, linestyle="--", alpha=0.9)
-    ax.axhline(entry, color="#111827", linewidth=1.15, linestyle="--", alpha=0.9)
     ax.axhline(result.price, color="#6b7280", linewidth=1.1, linestyle="--", alpha=0.7)
 
     # На графике всегда четыре стандартных уровня: 38.2 / 50 / 61.8 / 78.6.
@@ -1474,7 +1629,8 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
 
     ax.text(
         0.78, 0.98,
-        f"RR TP1: {rr:.2f}\nРынок: {_fmt(result.price)}\nНаклон/св: {candle_move:+.4f}%",
+        f"RR TP1: {metrics.rr_tp1:.2f}\nRR TP2: {metrics.rr_tp2:.2f}\n"
+        f"RR план: {metrics.rr_plan:.2f}\nРынок: {_fmt(result.price)}",
         transform=ax.transAxes,
         va="top",
         ha="right",
@@ -1484,21 +1640,33 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
         bbox=dict(boxstyle="round,pad=0.35", facecolor="#ffffff", edgecolor="#2563eb", linewidth=1.3, alpha=0.97),
     )
 
-    actual_lows = [df["low"].min(), result.price, stop, entry, result.projection.target_1, result.projection.target_2, *[v for _, v in fib_items]]
-    actual_highs = [df["high"].max(), result.price, stop, entry, result.projection.target_1, result.projection.target_2, *[v for _, v in fib_items]]
-    ymin, ymax = min(actual_lows), max(actual_highs)
+    # Масштаб строится по свечам и Fibonacci. Далёкая стенка стакана/ошибочный
+    # торговый уровень больше не может сжать свечи в тонкую линию.
+    base_values = [float(df["low"].min()), float(df["high"].max()), result.price,
+                   result.fib_start_price, result.fib_end_price, *[v for _, v in fib_items]]
+    base_low, base_high = min(base_values), max(base_values)
+    base_span = max(base_high - base_low, result.price * 0.01, 1e-12)
+    display_levels = [entry, stop, tp1, tp2]
+    nearby_levels = [v for v in display_levels if base_low - base_span * 0.8 <= v <= base_high + base_span * 0.8]
+    ymin = min([base_low, *nearby_levels])
+    ymax = max([base_high, *nearby_levels])
     pad = max((ymax - ymin) * 0.12, max(result.price, 1e-9) * 0.004)
     ax.set_ylim(ymin - pad, ymax + pad)
+    visible_min, visible_max = ax.get_ylim()
+    if visible_min <= stop <= visible_max:
+        ax.axhline(stop, color="#ef4444", linewidth=1.15, linestyle="--", alpha=0.9)
+    if visible_min <= entry <= visible_max:
+        ax.axhline(entry, color="#111827", linewidth=1.15, linestyle="--", alpha=0.9)
     # Нижние 22% оставляем под блок рекомендации, чтобы STOP/ENTRY/Fib не перекрывались с ним.
     lower_bound = ymin + (ymax - ymin) * 0.28
     upper_bound = ymax - (ymax - ymin) * 0.14
     min_gap = max((ymax - ymin) * 0.055, max(result.price, 1e-9) * 0.0030)
 
-    side_labels = [
+    side_labels = [item for item in [
         {"y_actual": stop, "text": f"СТОП {_fmt(stop)}", "edge": "#ef4444", "text_color": "black", "linewidth": 1.4},
         {"y_actual": entry, "text": f"ВХОД {_fmt(entry)}", "edge": "#111827", "text_color": "black", "linewidth": 1.4},
         {"y_actual": result.price, "text": f"ЦЕНА {_fmt(result.price)}", "edge": "#9ca3af", "text_color": "#374151", "linewidth": 1.2},
-    ] + [
+    ] if visible_min <= float(item["y_actual"]) <= visible_max] + [
         {"y_actual": level, "text": f"Фибо {name} — {_fmt(level)}", "edge": "#047857", "text_color": "#047857", "linewidth": 1.4}
         for name, level in fib_items
     ]
@@ -1526,23 +1694,27 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
 
     arrow_color = "#111827"
     arrow_target = result.projection.target_1
-    arrow_text_y = result.price + (ymax - ymin) * (0.035 if direction == "SHORT" else -0.035)
-    ax.annotate(
-        direction,
-        xy=(right_x + 1.7, arrow_target),
-        xytext=(right_x - 8.0, arrow_text_y),
-        fontsize=16,
-        fontweight="bold",
-        color="black",
-        arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.6),
-        annotation_clip=False,
-    )
+    if visible_min <= arrow_target <= visible_max:
+        arrow_text_y = result.price + (ymax - ymin) * (0.035 if direction == "SHORT" else -0.035)
+        ax.annotate(
+            direction,
+            xy=(right_x + 1.7, arrow_target),
+            xytext=(right_x - 8.0, arrow_text_y),
+            fontsize=16,
+            fontweight="bold",
+            color="black",
+            arrowprops=dict(arrowstyle="->", color=arrow_color, linewidth=1.6),
+            annotation_clip=False,
+        )
 
+    rec_header = "WAIT" if result.recommendation.startswith("WAIT") else "РЕКОМЕНДАЦИЯ"
     rec_text = (
-        "РЕКОМЕНДАЦИЯ\n"
+        f"{rec_header}\n"
         f"Вход: {_fmt(entry)}\n"
         f"Стоп: {_fmt(stop)}\n"
-        f"Цели:\n1) {_fmt(tp1)}\n2) {_fmt(tp2)}\nRR TP1: {rr:.2f}"
+        f"Цели:\n1) {_fmt(tp1)}\n2) {_fmt(tp2)}\n"
+        f"RR TP1: {metrics.rr_tp1:.2f}\nRR TP2: {metrics.rr_tp2:.2f}\n"
+        f"RR план 50/50: {metrics.rr_plan:.2f}\nОценка: {expectancy_r:+.2f}R"
     )
     rec_y = 0.018 if not full_analysis_text else 0.030
     fig.text(

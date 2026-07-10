@@ -39,6 +39,20 @@ class PriceProjection:
     move_1_percent: float
     move_2_percent: float
     text: str
+    entry: float = 0.0
+
+
+@dataclass(frozen=True)
+class TradePlanMetrics:
+    entry: float
+    stop: float
+    tp1: float
+    tp2: float
+    risk: float
+    rr_tp1: float
+    rr_tp2: float
+    rr_plan: float
+    valid_geometry: bool
 
 
 @dataclass
@@ -69,6 +83,9 @@ FIB_LEVEL_SEQUENCE = ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
 FIB_DISPLAY_SEQUENCE = ["23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]
 FIB_CHART_SEQUENCE = ["38.2%", "50%", "61.8%", "78.6%"]
 FIB_LOOKBACK = 90
+TP1_POSITION_SHARE = 0.50
+TP2_POSITION_SHARE = 0.50
+MIN_PLAN_EXPECTANCY_R = 0.05
 
 
 def _format_price(value: float) -> str:
@@ -101,24 +118,101 @@ def _chart_fib_items(fib_levels: dict[str, float]) -> list[tuple[str, float]]:
     return [(name, float(fib_levels[name])) for name in FIB_CHART_SEQUENCE if name in fib_levels]
 
 
-def _trade_plan_values(price: float, support: OrderBookLevel, resistance: OrderBookLevel, projection: PriceProjection) -> tuple[float, float, float, float, float]:
-    direction = projection.direction
-    entry = float(price)
+def _trade_plan_metrics(
+    price: float,
+    support: OrderBookLevel,
+    resistance: OrderBookLevel,
+    projection: PriceProjection,
+) -> TradePlanMetrics:
+    """Единый расчёт риска и RR для двух целей.
+
+    TP1 и TP2 считаются как две половины позиции. Геометрия проверяется
+    направленно, поэтому модуль разницы не может скрыть перепутанный стоп/тейк.
+    """
+    del support, resistance  # уровни уже провалидированы и записаны в projection
+    entry = float(projection.entry) if float(getattr(projection, "entry", 0.0) or 0.0) > 0 else float(price)
     stop = float(projection.invalidation)
-    if direction == "SHORT":
-        stop = max(stop, float(resistance.price))
-        if float(support.price) < float(price):
-            entry = float(support.price)
-    else:
-        stop = min(stop, float(support.price))
-        if float(resistance.price) > float(price):
-            entry = float(resistance.price)
     tp1 = float(projection.target_1)
     tp2 = float(projection.target_2)
-    risk = abs(entry - stop)
-    reward = abs(tp1 - entry)
-    rr = reward / risk if risk > 0 else 0.0
-    return float(entry), float(stop), tp1, tp2, float(rr)
+    direction = str(projection.direction).upper()
+
+    finite = all(math.isfinite(v) and v > 0 for v in (entry, stop, tp1, tp2))
+    if direction == "LONG":
+        valid_geometry = finite and stop < entry < tp1 < tp2
+        reward_1 = tp1 - entry
+        reward_2 = tp2 - entry
+    elif direction == "SHORT":
+        valid_geometry = finite and stop > entry > tp1 > tp2
+        reward_1 = entry - tp1
+        reward_2 = entry - tp2
+    else:
+        valid_geometry = False
+        reward_1 = 0.0
+        reward_2 = 0.0
+
+    risk = abs(entry - stop) if finite else 0.0
+    if risk <= 1e-15:
+        valid_geometry = False
+        rr_tp1 = 0.0
+        rr_tp2 = 0.0
+    else:
+        rr_tp1 = max(float(reward_1), 0.0) / risk
+        rr_tp2 = max(float(reward_2), 0.0) / risk
+
+    total_share = TP1_POSITION_SHARE + TP2_POSITION_SHARE
+    if total_share <= 0:
+        rr_plan = 0.0
+        valid_geometry = False
+    else:
+        rr_plan = (TP1_POSITION_SHARE * rr_tp1 + TP2_POSITION_SHARE * rr_tp2) / total_share
+
+    return TradePlanMetrics(
+        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk=float(risk),
+        rr_tp1=float(rr_tp1), rr_tp2=float(rr_tp2), rr_plan=float(rr_plan),
+        valid_geometry=bool(valid_geometry),
+    )
+
+
+def _trade_plan_values(
+    price: float, support: OrderBookLevel, resistance: OrderBookLevel, projection: PriceProjection
+) -> tuple[float, float, float, float, float]:
+    """Совместимый старый интерфейс: последний элемент — RR до TP1."""
+    metrics = _trade_plan_metrics(price, support, resistance, projection)
+    return metrics.entry, metrics.stop, metrics.tp1, metrics.tp2, metrics.rr_tp1
+
+
+def _plan_expectancy_r(metrics: TradePlanMetrics, direction_probability: float) -> float:
+    """Оценка преимущества плана в R с учётом обоих тейков 50/50.
+
+    Это фильтр качества текущей модели, а не обещание реальной доходности.
+    """
+    probability = float(np.clip(direction_probability / 100.0, 0.0, 1.0))
+    return float(probability * metrics.rr_plan - (1.0 - probability))
+
+
+def _apply_trade_plan_filter(
+    recommendation: str,
+    projection: PriceProjection,
+    metrics: TradePlanMetrics,
+    long_probability: float,
+    short_probability: float,
+) -> tuple[str, float]:
+    """Не блокирует сделку из-за одного TP1; оценивает весь план."""
+    direction_probability = long_probability if projection.direction == "LONG" else short_probability
+    expectancy_r = _plan_expectancy_r(metrics, direction_probability)
+
+    # NEUTRAL уже означает отсутствие сильного направления — RR не должен превращать его в сделку.
+    if recommendation.startswith("NEUTRAL"):
+        return recommendation, expectancy_r
+    if not metrics.valid_geometry:
+        return "WAIT / некорректная геометрия входа, стопа или целей", expectancy_r
+    if expectancy_r < MIN_PLAN_EXPECTANCY_R:
+        return (
+            f"WAIT / слабый план: RR плана {metrics.rr_plan:.2f}, "
+            f"оценка {expectancy_r:+.2f}R",
+            expectancy_r,
+        )
+    return recommendation, expectancy_r
 
 
 def klines_to_df(klines: list[list[Any]]) -> pd.DataFrame:
@@ -138,7 +232,7 @@ def klines_to_df(klines: list[list[Any]]) -> pd.DataFrame:
 
 def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, bins: int = 45) -> OrderBookLevel:
     parsed = np.array([[float(p), float(q)] for p, q in levels if float(q) > 0], dtype=float)
-    if parsed.size == 0:
+    if parsed.size == 0 or current_price <= 0:
         return OrderBookLevel(current_price, 0.0)
     if side == "bid":
         parsed = parsed[parsed[:, 0] < current_price]
@@ -147,15 +241,36 @@ def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, 
     if len(parsed) == 0:
         return OrderBookLevel(current_price, 0.0)
 
-    prices = parsed[:, 0]
-    quantities = parsed[:, 1]
+    # Стакан может содержать огромную далёкую стенку. Она не является рабочим
+    # уровнем для текущего входа и не должна ломать масштаб графика.
+    distances = np.abs(parsed[:, 0] / current_price - 1.0)
+    local = parsed[distances <= 0.03]  # рабочая зона: не дальше 5% от рынка
+    if len(local) < 3:
+        nearest_order = np.argsort(distances)
+        nearest_distance = float(distances[nearest_order[0]])
+        if nearest_distance > 0.10:
+            return OrderBookLevel(current_price, 0.0)
+        local = parsed[nearest_order[: min(40, len(parsed))]]
+        local_distances = np.abs(local[:, 0] / current_price - 1.0)
+        local = local[local_distances <= 0.10]
+    if len(local) == 0:
+        return OrderBookLevel(current_price, 0.0)
+
+    prices = local[:, 0]
+    quantities = local[:, 1]
     notional = prices * quantities
-    hist, edges = np.histogram(prices, bins=min(bins, max(8, len(parsed) // 7)), weights=notional)
+    hist, edges = np.histogram(prices, bins=min(bins, max(8, len(local) // 7)), weights=notional)
     idx = int(np.argmax(hist))
     left, right = edges[idx], edges[idx + 1]
     mask = (prices >= left) & (prices <= right)
     cluster_price = float(np.average(prices[mask], weights=notional[mask])) if mask.any() else float(prices[np.argmax(notional)])
     return OrderBookLevel(price=cluster_price, volume=float(hist[idx]))
+
+
+def _level_is_local(level_price: float, current_price: float, max_distance: float = 0.04) -> bool:
+    if current_price <= 0 or level_price <= 0:
+        return False
+    return abs(level_price / current_price - 1.0) <= max_distance
 
 
 def _fibonacci_move_threshold(window: pd.DataFrame) -> tuple[float, float]:
@@ -657,22 +772,61 @@ def _trend_score(df: pd.DataFrame) -> float:
     return float(np.clip((ema_score + mom_score) / 2, -1, 1))
 
 
-def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, resistance: OrderBookLevel, long_probability: float) -> PriceProjection:
-    levels = sorted(set([*fibs.values(), support.price, resistance.price]))
-    above = [v for v in levels if v > price]
-    below = [v for v in levels if v < price]
+def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, resistance: OrderBookLevel, long_probability: float, interval: str, df: pd.DataFrame) -> PriceProjection:
+    """Строит торговый план, сохраняя нормальную логику для BTC/ETH и отсекая только дальние стенки.
+
+    Важное правило: локальные уровни стакана обрабатываются по прежней логике,
+    а не локальные исключаются до расчёта. Поэтому DOGS с далёкой стенкой не ломает
+    масштаб/вход, но близкие уровни ETH/BTC продолжают давать прежние entry/SL/TP.
+    """
+    step = _timeframe_target_step(interval, price, df)
+    min_gap = max(step * 0.35, price * 0.0015, 1e-12)
+    trigger_limit = max(step * 1.75, price * 0.025)
+
+    support_local = support.price < price and _level_is_local(support.price, price, 0.04)
+    resistance_local = resistance.price > price and _level_is_local(resistance.price, price, 0.04)
+    support_trade = support_local and (price - support.price) <= trigger_limit
+    resistance_trade = resistance_local and (resistance.price - price) <= trigger_limit
+
+    effective_support = float(support.price) if support_trade else float(price)
+    effective_resistance = float(resistance.price) if resistance_trade else float(price)
+    levels = list(float(v) for v in fibs.values() if np.isfinite(v) and v > 0)
+    if support_trade:
+        levels.append(effective_support)
+    if resistance_trade:
+        levels.append(effective_resistance)
+    levels = sorted(set(levels))
+
     if long_probability >= 50:
-        t1 = above[0] if above else price * 1.015
-        t2 = above[1] if len(above) > 1 else t1 * 1.012
-        inv = below[-1] if below else price * 0.985
+        entry = max(float(price), effective_resistance)
+        candidates = [v for v in levels if v > entry + min_gap]
+        t1, t2 = _unique_targets(candidates, entry, "LONG", step, 2)
+
+        # Сохраняем прежнюю логику стопа для нормальных локальных уровней:
+        # ближайший уровень ниже самой нижней из точек market/support с запасом min_gap.
+        stop_reference = min(float(price), effective_support)
+        inv_candidates = [v for v in levels if v < stop_reference - min_gap]
+        inv = inv_candidates[-1] if inv_candidates else stop_reference - step * 0.8
+
+        # Только аварийный предел от абсурдно далёкого стопа.
+        floor = price - max(step * 4.0, price * 0.08)
+        inv = max(inv, floor)
         direction = "LONG"
-        text = f"При удержании поддержки цель: {_format_price(t1)} → {_format_price(t2)}; отмена ниже {_format_price(inv)}"
+        text = f"При пробое/удержании выше {_fmt_plain(entry)} цель: {_fmt_plain(t1)} → {_fmt_plain(t2)}; отмена ниже {_fmt_plain(inv)}"
     else:
-        t1 = below[-1] if below else price * 0.985
-        t2 = below[-2] if len(below) > 1 else t1 * 0.988
-        inv = above[0] if above else price * 1.015
+        entry = min(float(price), effective_support)
+        candidates = [v for v in levels if v < entry - min_gap]
+        t1, t2 = _unique_targets(candidates, entry, "SHORT", step, 2)
+
+        stop_reference = max(float(price), effective_resistance)
+        inv_candidates = [v for v in levels if v > stop_reference + min_gap]
+        inv = inv_candidates[0] if inv_candidates else stop_reference + step * 0.8
+
+        ceiling = price + max(step * 4.0, price * 0.08)
+        inv = min(inv, ceiling)
         direction = "SHORT"
-        text = f"При пробое вниз цель: {_format_price(t1)} → {_format_price(t2)}; отмена выше {_format_price(inv)}"
+        text = f"При пробое/удержании ниже {_fmt_plain(entry)} цель: {_fmt_plain(t1)} → {_fmt_plain(t2)}; отмена выше {_fmt_plain(inv)}"
+
     return PriceProjection(
         direction=direction,
         target_1=float(t1),
@@ -681,8 +835,8 @@ def _projection(price: float, fibs: dict[str, float], support: OrderBookLevel, r
         move_1_percent=float((t1 / price - 1) * 100),
         move_2_percent=float((t2 / price - 1) * 100),
         text=text,
+        entry=float(entry),
     )
-
 
 def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list[list[Any]]) -> AnalysisResult:
     df = klines_to_df(klines)
@@ -716,7 +870,11 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
     else:
         recommendation = "NEUTRAL / нет сильного перевеса, ждать подтверждения"
 
-    entry, stop, tp1, tp2, rr = _trade_plan_values(price, support, resistance, projection)
+    metrics = _trade_plan_metrics(price, support, resistance, projection)
+    entry, stop, tp1, tp2 = metrics.entry, metrics.stop, metrics.tp1, metrics.tp2
+    recommendation, expectancy_r = _apply_trade_plan_filter(
+        recommendation, projection, metrics, long_probability, short_probability
+    )
     ordered_fibs = _ordered_fib_items(fibs)
     fib_text = "\n".join([f"• Fib {k}: `{_format_price(v)}`" for k, v in ordered_fibs])
     text = (
@@ -734,7 +892,10 @@ def analyze(symbol: str, interval: str, order_book: dict[str, Any], klines: list
         f"Вход: `{_format_price(entry)}`\n"
         f"Стоп: `{_format_price(stop)}`\n"
         f"Цели:\n1) `{_format_price(tp1)}`\n2) `{_format_price(tp2)}`\n"
-        f"RR TP1: `{rr:.2f}`\n"
+        f"RR TP1: `{metrics.rr_tp1:.2f}`\n"
+        f"RR TP2: `{metrics.rr_tp2:.2f}`\n"
+        f"RR плана 50/50: `{metrics.rr_plan:.2f}`\n"
+        f"Оценка плана: `{expectancy_r:+.2f}R`\n"
         f"⚖️ Дисбаланс стакана: `{orderbook_bias * 100:.1f}%`\n"
         f"🧭 Тренд: `{trend_bias * 100:.1f}%`\n\n"
         f"✅ Рекомендация: *{recommendation}*\n\n"

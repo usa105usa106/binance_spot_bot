@@ -9,9 +9,9 @@ from matplotlib.ticker import FuncFormatter
 import mplfinance as mpf
 
 try:
-    from .analysis import AnalysisResult, _chart_fib_items
+    from .analysis import AnalysisResult, _chart_fib_items, _trade_plan_metrics, _plan_expectancy_r
 except ImportError:  # direct module execution / Railway root
-    from analysis import AnalysisResult, _chart_fib_items
+    from analysis import AnalysisResult, _chart_fib_items, _trade_plan_metrics, _plan_expectancy_r
 
 
 def _fmt(value: float) -> str:
@@ -99,10 +99,7 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
         "78.6%": "#60a5fa",
         "100%": "#e5e7eb",
     }
-    for name in ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]:
-        if name not in result.fib_levels:
-            continue
-        level = result.fib_levels[name]
+    for name, level in _chart_fib_items(result.fib_levels):
         color = fib_colors.get(name, "#94a3b8")
         ax.axhline(level, color=color, linewidth=1.35, linestyle="--", alpha=0.82)
         ax.text(right_x + 1, level, f"  Fib {name}  {_fmt(level)}", color=color, va="center", fontsize=11, fontweight="bold")
@@ -138,13 +135,18 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
     ax.axhline(proj.invalidation, color="#94a3b8", linewidth=1.2, linestyle=":", alpha=0.75)
     ax.text(1, proj.invalidation, f"Отмена сценария: {_fmt(proj.invalidation)}", color="#cbd5e1", fontsize=10, va="center")
 
+    metrics = _trade_plan_metrics(result.price, result.support, result.resistance, result.projection)
+    direction_probability = result.long_probability if proj.direction == "LONG" else result.short_probability
+    expectancy_r = _plan_expectancy_r(metrics, direction_probability)
+
     # Информационная панель на графике.
     info = (
         f"LONG {result.long_probability:.1f}%  |  SHORT {result.short_probability:.1f}%\n"
         f"Прогноз: {proj.direction}\n"
         f"Фибо {result.fib_direction}: {_fmt(result.fib_start_price)} → {_fmt(result.fib_end_price)}\n"
         f"{proj.text}\n"
-        f"Стакан: {result.orderbook_bias * 100:+.1f}% · Тренд: {result.trend_bias * 100:+.1f}%"
+        f"RR TP1/TP2/план: {metrics.rr_tp1:.2f} / {metrics.rr_tp2:.2f} / {metrics.rr_plan:.2f}\n"
+        f"Оценка: {expectancy_r:+.2f}R · Стакан: {result.orderbook_bias * 100:+.1f}% · Тренд: {result.trend_bias * 100:+.1f}%"
     )
     ax.text(
         0.012, 0.965, info,
@@ -157,9 +159,14 @@ def make_chart(result: AnalysisResult, full_analysis_text: str | None = None) ->
 
     # Чтобы справа поместились подписи и стрелки прогноза.
     ax.set_xlim(-2, len(df) + 28)
-    lows = [df["low"].min(), *result.fib_levels.values(), result.support.price, proj.target_1, proj.target_2, proj.invalidation]
-    highs = [df["high"].max(), *result.fib_levels.values(), result.resistance.price, proj.target_1, proj.target_2, proj.invalidation]
-    ymin, ymax = min(lows), max(highs)
+    base_values = [float(df["low"].min()), float(df["high"].max()), result.price,
+                   result.fib_start_price, result.fib_end_price,
+                   *[v for _, v in _chart_fib_items(result.fib_levels)]]
+    base_low, base_high = min(base_values), max(base_values)
+    base_span = max(base_high - base_low, result.price * 0.01, 1e-12)
+    nearby = [v for v in [proj.entry, proj.target_1, proj.target_2, proj.invalidation, result.support.price, result.resistance.price]
+              if base_low - base_span * 0.8 <= v <= base_high + base_span * 0.8]
+    ymin, ymax = min([base_low, *nearby]), max([base_high, *nearby])
     pad = max((ymax - ymin) * 0.10, result.price * 0.005)
     ax.set_ylim(ymin - pad, ymax + pad)
 
