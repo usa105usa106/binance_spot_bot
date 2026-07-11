@@ -1,1 +1,1 @@
-"""Trading bot package."""
+__version__ = "00018"

@@ -35,7 +35,7 @@ DEFAULT_QUOTE=USDT
 ORDERBOOK_LIMIT=1000
 MONITOR_INTERVAL_MINUTES=30
 STRONG_CHANGE_THRESHOLD=20
-BOT_VERSION=00016
+BOT_VERSION=00018
 BINANCE_BASE_URL=https://api.binance.com
 BINANCE_BASE_URLS=https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision
 ```
@@ -170,6 +170,16 @@ python bot.py
 - На графике и в текстовом скане показываются `RR TP1`, `RR TP2`, `RR плана` и оценка преимущества в R.
 - Исправления дальних стенок стакана и структурного Fibonacci сохранены без изменений.
 
+
+## v00017 — safe Telegram captions + DOGS/manual analysis fix
+
+- Убрано опасное обрезание Markdown `caption[:1024]`.
+- Подпись к фото теперь режется по лимиту Telegram в UTF-16 и отправляется обычным текстом без `parse_mode`.
+- Остаток анализа отправляется отдельными сообщениями без дублирования первой части.
+- Ручной анализ DOGS и других микромонет больше не падает на `Can't parse entities`.
+- Автосигнал сохраняет новый снимок стакана только после успешной доставки уведомления.
+- Добавлены логи `ANALYSIS_SENT`, `AUTO_ALERT_SENT`, `AUTO_ALERT_FAILED`.
+
 ## v00016 — auto threshold 20%
 
 - Порог сильного изменения стакана снижен с 35% до 20%.
@@ -179,3 +189,11 @@ python bot.py
 - `/log_full` удаляет Telegram-токены из старых логов, а `httpx` больше не пишет URL с токеном на уровне INFO.
 - Автопланировщик и логика анализа/Fibonacci/двух тейков не изменялись.
 
+
+## v00018 — single runtime source + modular regression fix
+
+- Исправлен скрытый `TypeError` в отдельном `analysis.py`, где `_projection()` вызывался без `interval` и `df`.
+- Удалено расхождение между `bot.py` и дублирующими модулями: `analysis.py`, `charting.py`, `telegram_bot.py`, `monitor.py`, `telegram_delivery.py`, `config.py`, `binance_client.py`, `storage.py` теперь являются совместимыми фасадами к одной канонической реализации.
+- Старый модульный Telegram-путь больше не выполняет синхронные Binance-запросы внутри устаревших async-обработчиков: он использует тот же исправленный `TradingBot`, что и основной запуск.
+- Добавлена полная регрессионная проверка модульного `analyze()` и идентичности ключевых экспортов с рабочим `bot.py`.
+- Логика Fibonacci, DOGS/далёких стенок, ETH/BTC, двух тейков, safe caption и порог auto 20% не менялась.

@@ -29,7 +29,7 @@ class Config:
     orderbook_limit: int = 1000
     monitor_interval_minutes: int = 30
     strong_change_threshold: float = 20.0
-    bot_version: str = "00016"
+    bot_version: str = "00018"
 
 
 def get_config() -> Config:
@@ -44,7 +44,7 @@ def get_config() -> Config:
         orderbook_limit=int(os.getenv("ORDERBOOK_LIMIT", "1000")),
         monitor_interval_minutes=int(os.getenv("MONITOR_INTERVAL_MINUTES", "30")),
         strong_change_threshold=float(os.getenv("STRONG_CHANGE_THRESHOLD", "20")),
-        bot_version=os.getenv("BOT_VERSION", "00016"),
+        bot_version=os.getenv("BOT_VERSION", "00018"),
     )
 
 # ===== bot/binance_client.py =====
@@ -700,7 +700,7 @@ def _aggregate_levels(levels: list[list[str]], current_price: float, side: str, 
     # Стакан может содержать огромную далёкую стенку. Она не является рабочим
     # уровнем для текущего входа и не должна ломать масштаб графика.
     distances = np.abs(parsed[:, 0] / current_price - 1.0)
-    local = parsed[distances <= 0.03]  # рабочая зона: не дальше 5% от рынка
+    local = parsed[distances <= 0.03]  # рабочая зона: не дальше 3% от рынка
     if len(local) < 3:
         nearest_order = np.argsort(distances)
         nearest_distance = float(distances[nearest_order[0]])
@@ -1780,6 +1780,113 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 
+CAPTION_LIMIT_UTF16 = 1024
+MESSAGE_LIMIT_UTF16 = 4096
+
+
+def telegram_utf16_units(text: str) -> int:
+    return len(str(text).encode("utf-16-le")) // 2
+
+
+def markdown_to_plain(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(r"`([^`\n]*)`", r"\1", value)
+        value = re.sub(r"\*([^*\n]+)\*", r"\1", value)
+        value = re.sub(r"_([^_\n]+)_", r"\1", value)
+    return value.strip()
+
+
+def _max_telegram_prefix_index(text: str, limit_utf16: int) -> int:
+    if telegram_utf16_units(text) <= limit_utf16:
+        return len(text)
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if telegram_utf16_units(text[:mid]) <= limit_utf16:
+            low = mid
+        else:
+            high = mid - 1
+    return max(low, 1)
+
+
+def split_telegram_text(text: str, first_limit: int = CAPTION_LIMIT_UTF16, next_limit: int = MESSAGE_LIMIT_UTF16) -> list[str]:
+    remaining = str(text or "").strip()
+    if not remaining:
+        return []
+    chunks: list[str] = []
+    limit = int(first_limit)
+    while remaining:
+        prefix_end = _max_telegram_prefix_index(remaining, limit)
+        if prefix_end >= len(remaining):
+            chunks.append(remaining)
+            break
+        minimum_natural_cut = max(1, int(prefix_end * 0.55))
+        newline_cut = remaining.rfind("\n", minimum_natural_cut, prefix_end + 1)
+        space_cut = remaining.rfind(" ", minimum_natural_cut, prefix_end + 1)
+        cut = max(newline_cut, space_cut)
+        if cut < 1:
+            cut = prefix_end
+        chunk = remaining[:cut].rstrip()
+        if not chunk:
+            chunk = remaining[:prefix_end]
+            cut = prefix_end
+        chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+        limit = int(next_limit)
+    return chunks
+
+
+async def send_text_chunks(send_text: Any, formatted_text: str, *, text_kwargs: dict[str, Any] | None = None) -> int:
+    """Send long generated analysis as safe plain-text Telegram chunks."""
+    plain = markdown_to_plain(formatted_text)
+    chunks = split_telegram_text(
+        plain,
+        first_limit=MESSAGE_LIMIT_UTF16,
+        next_limit=MESSAGE_LIMIT_UTF16,
+    )
+    options = dict(text_kwargs or {})
+    for chunk in chunks:
+        await send_text(text=chunk, **options)
+    return len(chunks)
+
+
+def _rewind_photo(photo: Any) -> None:
+    seek = getattr(photo, "seek", None)
+    if callable(seek):
+        try:
+            seek(0)
+        except Exception:
+            pass
+
+
+async def send_photo_with_text(send_photo: Any, send_text: Any, photo: Any, formatted_text: str, *, photo_kwargs: dict[str, Any] | None = None, text_kwargs: dict[str, Any] | None = None) -> int:
+    plain = markdown_to_plain(formatted_text)
+    chunks = split_telegram_text(plain)
+    photo_options = dict(photo_kwargs or {})
+    message_options = dict(text_kwargs or {})
+    caption = chunks[0] if chunks else None
+    try:
+        if caption:
+            await send_photo(photo=photo, caption=caption, **photo_options)
+        else:
+            await send_photo(photo=photo, **photo_options)
+    except BadRequest as exc:
+        reason = str(exc).lower()
+        if "can't parse entities" not in reason and "caption is too long" not in reason:
+            raise
+        _rewind_photo(photo)
+        await send_photo(photo=photo, **photo_options)
+        for chunk in chunks:
+            await send_text(text=chunk, **message_options)
+        return len(chunks)
+    for chunk in chunks[1:]:
+        await send_text(text=chunk, **message_options)
+    return len(chunks)
+
+
 TIMEFRAMES = ["15m", "1h", "4h", "1d", "1w"]
 START_TIME = time.time()
 
@@ -2137,12 +2244,21 @@ class TradingBot:
             try:
                 with chart.open("rb") as photo:
                     if user["visualization"] == "split":
-                        # Режим визуализации: весь анализ внутри картинки, без отдельного текста под фото.
+                        # В split весь анализ уже находится внутри изображения.
                         await update.message.reply_photo(photo=photo, reply_markup=self.main_keyboard())
+                        chunks_sent = 0
                     else:
-                        await update.message.reply_photo(photo=photo, caption=caption[:1024], parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard())
-                if user["visualization"] != "split" and len(caption) > 1024:
-                    await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
+                        chunks_sent = await send_photo_with_text(
+                            update.message.reply_photo,
+                            update.message.reply_text,
+                            photo,
+                            caption,
+                            photo_kwargs={"reply_markup": self.main_keyboard()},
+                        )
+                logging.getLogger("trading-bot").info(
+                    "ANALYSIS_SENT chat=%s symbol=%s mode=%s text_chunks=%s",
+                    chat_id, symbol, user["visualization"], chunks_sent,
+                )
             finally:
                 Path(chart).unlink(missing_ok=True)
         except Exception as exc:
@@ -2275,6 +2391,18 @@ async def _monitor_one_symbol(
         started_at = int(time.time())
         interval_minutes = max(1, int(current_user.get("monitor_interval_minutes") or config.monitor_interval_minutes))
         storage.mark_monitor_attempt(chat_id, symbol, started_at)
+
+        def commit_success(signature: dict[str, float], timestamp: int) -> int:
+            # Снимок становится новой базой только после полностью успешного цикла.
+            storage.set_snapshot(chat_id, symbol, signature, timestamp)
+            next_check_at = max(started_at + interval_minutes * 60, timestamp + 5)
+            storage.mark_monitor_success(chat_id, symbol, timestamp, next_check_at)
+            logger.info(
+                "AUTO_SCAN_OK chat=%s symbol=%s interval=%sm duration=%ss next=%s",
+                chat_id, symbol, interval_minutes, timestamp - started_at, next_check_at,
+            )
+            return next_check_at
+
         try:
             old, _ = storage.get_snapshot_meta(chat_id, symbol)
             order_book = await asyncio.to_thread(binance.order_book, symbol, config.orderbook_limit)
@@ -2282,25 +2410,20 @@ async def _monitor_one_symbol(
             if symbol not in storage.list_symbols(chat_id):
                 logger.info("AUTO_SCAN_SKIPPED_REMOVED chat=%s symbol=%s", chat_id, symbol)
                 return
+
             signature = compact_orderbook_signature(order_book)
             completed_at = int(time.time())
             current_user = storage.get_user(chat_id)
             interval_minutes = max(1, int(current_user.get("monitor_interval_minutes") or config.monitor_interval_minutes))
-            storage.set_snapshot(chat_id, symbol, signature, completed_at)
-            # Держим заданный ритм от начала проверки, а не накапливаем задержку сети каждый цикл.
-            next_check_at = max(started_at + interval_minutes * 60, completed_at + 5)
-            storage.mark_monitor_success(chat_id, symbol, completed_at, next_check_at)
-            logger.info(
-                "AUTO_SCAN_OK chat=%s symbol=%s interval=%sm duration=%ss next=%s",
-                chat_id, symbol, interval_minutes, completed_at - started_at, next_check_at,
-            )
 
             if not old:
+                commit_success(signature, completed_at)
                 logger.info(
                     "AUTO_SCAN_BASELINE chat=%s symbol=%s threshold=%.1f%%",
                     chat_id, symbol, config.strong_change_threshold,
                 )
                 return
+
             change = signature_change_percent(old, signature)
             signal = change >= config.strong_change_threshold
             logger.info(
@@ -2310,9 +2433,16 @@ async def _monitor_one_symbol(
                 float(old.get("bid_notional", 0.0)), float(signature.get("bid_notional", 0.0)),
                 float(old.get("ask_notional", 0.0)), float(signature.get("ask_notional", 0.0)),
             )
+
             if not signal:
+                commit_success(signature, completed_at)
                 return
+
+            # Если пользователь выключил авто между запросом и отправкой, не шлём сигнал,
+            # но сохраняем свежий снимок как нормальный завершённый цикл.
             if not bool(current_user.get("stakan_enabled")) or not bool(current_user.get("bot_enabled", 1)):
+                commit_success(signature, completed_at)
+                logger.info("AUTO_ALERT_SKIPPED_DISABLED chat=%s symbol=%s change=%.2f%%", chat_id, symbol, change)
                 return
 
             timeframe = current_user.get("timeframe", "1h")
@@ -2320,21 +2450,39 @@ async def _monitor_one_symbol(
             result = await asyncio.to_thread(analyze, symbol, timeframe, order_book, klines)
             text = "🚨 *Сильное изменение стакана*\n" f"Изменение ликвидности: *{change:.1f}%*\n\n" + result.text
             chart = await asyncio.to_thread(make_chart, result, text if current_user.get("visualization") == "split" else None)
+            chunks_sent = 0
             try:
                 with chart.open("rb") as photo:
                     if current_user.get("visualization") == "split":
                         await app.bot.send_photo(chat_id=chat_id, photo=photo)
                     else:
-                        await app.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=photo,
-                            caption=text[:1024],
-                            parse_mode=ParseMode.MARKDOWN,
+                        chunks_sent = await send_photo_with_text(
+                            app.bot.send_photo,
+                            app.bot.send_message,
+                            photo,
+                            text,
+                            photo_kwargs={"chat_id": chat_id},
+                            text_kwargs={"chat_id": chat_id},
                         )
-                if current_user.get("visualization") != "split" and len(text) > 1024:
-                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                logger.exception(
+                    "AUTO_ALERT_FAILED chat=%s symbol=%s change=%.2f%% snapshot_preserved=yes",
+                    chat_id, symbol, change,
+                )
+                raise
             finally:
                 Path(chart).unlink(missing_ok=True)
+
+            delivered_at = int(time.time())
+            # Не создаём заново состояние удалённого тикера после долгого анализа/отправки.
+            if symbol not in storage.list_symbols(chat_id):
+                logger.info("AUTO_ALERT_SENT_REMOVED chat=%s symbol=%s change=%.2f%%", chat_id, symbol, change)
+                return
+            commit_success(signature, delivered_at)
+            logger.info(
+                "AUTO_ALERT_SENT chat=%s symbol=%s change=%.2f%% mode=%s text_chunks=%s",
+                chat_id, symbol, change, current_user.get("visualization"), chunks_sent,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -1,9 +1,4 @@
-"""Compatibility facade for the canonical Telegram application in :mod:`bot`.
-
-All handlers now use the same implementation as ``python bot.py``.  This avoids
-old synchronous network calls and stale caption/auto-monitor behavior in the
-legacy modular path.
-"""
+"""Compatibility facade for safe Telegram delivery helpers in :mod:`bot`."""
 from __future__ import annotations
 
 try:
@@ -11,9 +6,6 @@ try:
 except ImportError:
     import bot as _runtime
 
-TradingBot = _runtime.TradingBot
-TIMEFRAMES = _runtime.TIMEFRAMES
-START_TIME = _runtime.START_TIME
 CAPTION_LIMIT_UTF16 = _runtime.CAPTION_LIMIT_UTF16
 MESSAGE_LIMIT_UTF16 = _runtime.MESSAGE_LIMIT_UTF16
 telegram_utf16_units = _runtime.telegram_utf16_units
@@ -23,9 +15,6 @@ send_photo_with_text = _runtime.send_photo_with_text
 send_text_chunks = _runtime.send_text_chunks
 
 __all__ = [
-    "TradingBot",
-    "TIMEFRAMES",
-    "START_TIME",
     "CAPTION_LIMIT_UTF16",
     "MESSAGE_LIMIT_UTF16",
     "telegram_utf16_units",
